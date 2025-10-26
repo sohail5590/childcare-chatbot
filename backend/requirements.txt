@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# Added for data ingestion and vectorization
+pandas
+sentence-transformers
+chromadb-client
+requests
+mysql-connector-python  # RE-ADDED
+SQLAlchemy            # ADDED for easier data ingestion
