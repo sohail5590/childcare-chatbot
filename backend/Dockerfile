@@ -16,10 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose port 8000 to allow communication with the API server from other containers
-EXPOSE 8000
+# Port will be 9000
+# EXPOSE 8000
 
 # The command to run when the container starts
 # This starts the Uvicorn server, which runs the FastAPI application
 # --host 0.0.0.0: Makes the server accessible from outside the container
 # --reload: Automatically restarts the server when code changes are detected (great for development)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9000", "--reload"]

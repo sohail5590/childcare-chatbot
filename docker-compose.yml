@@ -1,100 +1,45 @@
-# docker-compose.yml
-# Defines the multi-container application setup.
-# Version '3.8' is a modern and stable choice.
-version: '3.8'
-
-# The 'services' section is where each container is defined.
 services:
-  # 1. Frontend: The Streamlit user interface.
+  backend:
+    build:
+      context: ./Backend
+    container_name: rag_ccb_backend
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./Backend:/app
+      - ./Data:/app/Data
+    depends_on:
+      - chromodb
+      # - ollama
   frontend:
-    build: ./frontend
+    build:
+      context: ./Frontend
+    container_name: rag_ccb_frontend
     ports:
-      # Exposes the Streamlit port (8501) to your local machine.
       - "8501:8501"
-    environment:
-      # Passes the backend URL to the Streamlit app, so it knows where to send requests.
-      - BACKEND_API_URL=http://backend-api:8000/generate-query
-    # Ensures the backend is started before the frontend.
+    volumes:
+      - ./Frontend:/app
     depends_on:
-      - backend-api
-    # Connects the service to our custom network.
-    networks:
-      - movie-net
-
-  # 2. Backend: The FastAPI application that contains the main RAG logic.
-  backend-api:
-    build: ./backend
+      - backend
+  chromodb:
+    image: ghcr.io/chroma-core/chroma:latest
+    container_name: rag_ccb_chromadb
     ports:
-      # Exposes the API port (8000) for direct testing or access.
       - "8000:8000"
-    # Loads environment variables from the .env file (e.g., database credentials).
-    env_file: .env
-    # Controls startup order to prevent the backend from starting before its dependencies are ready.
-    depends_on:
-      db:
-        # Waits for the MySQL database to be healthy before starting.
-        condition: service_healthy
-      chroma:
-        condition: service_started
-      ollama:
-        condition: service_started
-    networks:
-      - movie-net
     volumes:
-      # Mounts the local backend code into the container for live reloading during development.
-      - ./backend:/app
+      - chromadb_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_models:/root/.ollama
+  #   restart: always
 
-  # 3. Database: The MySQL container for structured data.
-  db:
-    image: mysql:8.0
-    command: --default-authentication-plugin=mysql_native_password
-    restart: always
-    env_file: .env
-    ports:
-      - "3306:3306"
-    volumes:
-      # Maps the named volume 'mysql-data' to MySQL's internal data directory for persistence.
-      - mysql-data:/var/lib/mysql
-      # Runs the init.sql script on first launch to create the schema and index.
-      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
-    # A healthcheck ensures the database is fully operational before other services connect.
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u$$MYSQL_USER", "-p$$MYSQL_PASSWORD"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - movie-net
-
-  # 4. Vector Store: The ChromaDB container.
-  chroma:
-    image: chromadb/chroma
-    ports:
-      # Mapped to 8002 on the host to avoid conflicting with the backend's port 8000.
-      - "8002:8000"
-    volumes:
-      # Maps the named volume 'chroma-data' for vector persistence.
-      - chroma-data:/chroma/.chroma/
-    networks:
-      - movie-net
-
-  # 5. LLM: The Ollama service.
-  ollama:
-    image: ollama/ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      # Maps the named volume 'ollama-data' to persist downloaded models.
-      - ollama-data:/root/.ollama
-    networks:
-      - movie-net
-
-# The 'volumes' section declares the named volumes used for data persistence.
 volumes:
-  mysql-data:
-  chroma-data:
-  ollama-data:
-
-# The 'networks' section defines the custom network for inter-service communication.
-networks:
-  movie-net:
+  chromadb_data:
+  # ollama_models:
