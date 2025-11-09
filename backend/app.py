@@ -25,7 +25,20 @@ DATA_DIR = Path("/app/Data")
 DATA_DIR.mkdir(exist_ok=True)
 
 # Initialize ChromaDB client - Connect to ChromaDB container
-chroma_client = chromadb.HttpClient(host='chromodb', port=8000)
+import time, chromadb
+
+for attempt in range(10):
+    try:
+        chroma_client = chromadb.HttpClient(host="chromadb", port=8000)
+        # Quick sanity check to verify API is responsive
+        chroma_client.heartbeat()
+        print("✅ Connected to ChromaDB!")
+        break
+    except Exception as e:
+        print(f"⏳ Waiting for ChromaDB (attempt {attempt+1}/10): {e}")
+        time.sleep(3)
+else:
+    raise RuntimeError("❌ Could not connect to ChromaDB after multiple retries.")
 
 # Create or get collections for both states
 collection_california = chroma_client.get_or_create_collection(name="california_state")

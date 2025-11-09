@@ -1,27 +1,7 @@
+version: "3.9"
+
 services:
-  backend:
-    build:
-      context: ./Backend
-    container_name: rag_ccb_backend
-    ports:
-      - "9000:9000"
-    volumes:
-      - ./Backend:/app
-      - ./Data:/app/Data
-    depends_on:
-      - chromodb
-      # - ollama
-  frontend:
-    build:
-      context: ./Frontend
-    container_name: rag_ccb_frontend
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./Frontend:/app
-    depends_on:
-      - backend
-  chromodb:
+  chromadb:
     image: ghcr.io/chroma-core/chroma:latest
     container_name: rag_ccb_chromadb
     ports:
@@ -31,15 +11,46 @@ services:
     environment:
       - IS_PERSISTENT=TRUE
       - PERSIST_DIRECTORY=/chroma/chroma
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: ollama
-  #   ports:
-  #     - "11434:11434"
-  #   volumes:
-  #     - ollama_models:/root/.ollama
-  #   restart: always
+    # ✅ Minimal, guaranteed healthcheck: waits until TCP port 8000 is open
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8000'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: rag_ccb_backend
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./backend:/app
+      - ./Data:/app/Data
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    depends_on:
+      chromadb:
+        condition: service_healthy   # waits until ChromaDB passes healthcheck
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: rag_ccb_frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   chromadb_data:
-  # ollama_models:
