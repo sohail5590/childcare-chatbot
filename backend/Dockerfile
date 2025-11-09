@@ -1,16 +1,29 @@
 # Use an official lightweight Python image as a base
-FROM python:3.10-slim
-
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 # Set the working directory inside the container to /app
 WORKDIR /app
 
 # Copy the requirements file into the container first
 # This leverages Docker's layer caching, speeding up future builds if dependencies don't change
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    wget \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY zscalar-root.crt /usr/local/share/ca-certificates/zscalar-root.crt
+RUN update-ca-certificates
 COPY requirements.txt .
 
-# Install the Python dependencies listed in the requirements.txt file
-# The --no-cache-dir flag keeps the image size smaller
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org \
+    --trusted-host pypi.python.org \
+    --trusted-host files.pythonhosted.org \
+    -r requirements.txt
 
 # Copy the rest of the application's source code into the container
 COPY . .

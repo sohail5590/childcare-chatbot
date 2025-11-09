@@ -10,3 +10,10 @@ chromadb-client
 requests
 mysql-connector-python  # RE-ADDED
 SQLAlchemy            # ADDED for easier data ingestion
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-chroma
+langchain-huggingface
+python-multipart
