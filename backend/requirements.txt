@@ -17,3 +17,4 @@ langchain-text-splitters
 langchain-chroma
 langchain-huggingface
 python-multipart
+pypdf
