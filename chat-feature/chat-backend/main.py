@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from fastapi import FastAPI
@@ -11,15 +12,17 @@ from chromadb import HttpClient
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from openai import OpenAI
 from dotenv import load_dotenv
-import numpy as np
 
-# -------------------------------------------------------------
-# ENVIRONMENT SETUP
-# -------------------------------------------------------------
+# ==========================================================
+# 🌍 Environment Setup
+# ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
-env_path = BASE_DIR / ".env"
+PROJECT_ROOT = BASE_DIR.parent.parent  # go up twice: chat-backend → chat-feature → project root
+env_path = PROJECT_ROOT / ".env"
+
 if env_path.exists():
     load_dotenv(env_path)
+    print(f"✅ Loaded environment from {env_path}")
 else:
     print(f"⚠️ .env not found at {env_path}")
 
@@ -29,22 +32,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 
-print(f"✅ Loaded environment from: {env_path}")
-print(f"OPENAI_MODEL={OPENAI_MODEL}, CHROMA_HOST={CHROMA_HOST}:{CHROMA_PORT}")
+print(f"✅ Loaded environment from {env_path}")
+print(f"CHROMA_HOST={CHROMA_HOST}:{CHROMA_PORT}")
 
-STATE_TO_COLLECTION = {
-    "california": "california_state",
-    "new york": "newyork_state",
-}
-
-RETRIEVE_TOP_K_DEFAULT = 15
-RERANK_TOP_K_DEFAULT = 6
-MAX_HISTORY_MESSAGES = 10
-
-# -------------------------------------------------------------
-# INITIALIZE SERVICES
-# -------------------------------------------------------------
-app = FastAPI(title="Chat Backend — Unified Child Care")
+# ==========================================================
+# 🚀 App + Middleware
+# ==========================================================
+app = FastAPI(title="Chat Backend — Unified Child Care Chatbot")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +48,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def connect_chroma(retries=10, delay=1.5) -> HttpClient:
+# ==========================================================
+# 🔗 Initialize Clients
+# ==========================================================
+def connect_chroma(retries=10, delay=2.0):
     last_err = None
     for _ in range(retries):
         try:
@@ -66,24 +63,27 @@ def connect_chroma(retries=10, delay=1.5) -> HttpClient:
             last_err = e
             print(f"⏳ Waiting for ChromaDB... {e}")
             time.sleep(delay)
-    raise RuntimeError(f"Could not connect to Chroma at {CHROMA_HOST}:{CHROMA_PORT}: {last_err}")
+    raise RuntimeError(f"❌ Could not connect to ChromaDB: {last_err}")
 
 chroma_client = connect_chroma()
-
-# Embedder + Reranker
 embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-# OpenAI client
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is required.")
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------------------------------------------
-# SCHEMAS
-# -------------------------------------------------------------
+STATE_TO_COLLECTION = {
+    "california": "california_state",
+    "new york": "newyork_state",
+}
+
+RETRIEVE_TOP_K_DEFAULT = 15
+RERANK_TOP_K_DEFAULT = 8
+MAX_HISTORY_MESSAGES = 10
+
+# ==========================================================
+# 🧩 Models
+# ==========================================================
 class ChatTurn(BaseModel):
-    role: str  # 'user' or 'assistant'
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
@@ -95,11 +95,12 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    next_question: str
     sources: List[Dict[str, Any]]
 
-# -------------------------------------------------------------
-# UTILITIES
-# -------------------------------------------------------------
+# ==========================================================
+# ⚙️ Helper Functions
+# ==========================================================
 def normalize_state(state: str) -> str:
     return state.strip().lower()
 
@@ -107,16 +108,15 @@ def pick_collection(state: str):
     key = normalize_state(state)
     name = STATE_TO_COLLECTION.get(key)
     if not name:
-        raise ValueError(f"Unsupported state '{state}'. Expected one of: {list(STATE_TO_COLLECTION.keys())}")
+        raise ValueError(f"Unsupported state '{state}'. Expected one of {list(STATE_TO_COLLECTION.keys())}")
     return chroma_client.get_or_create_collection(name=name)
 
 def retrieve(query: str, collection, top_k: int):
     q_emb = embedder.encode(query).tolist()
     results = collection.query(query_embeddings=[q_emb], n_results=top_k)
-
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
-    ids   = results.get("ids", [[]])[0]
+    ids = results.get("ids", [[]])[0]
     dists = results.get("distances", [[]])[0] if "distances" in results else [None] * len(docs)
 
     items = []
@@ -134,50 +134,106 @@ def rerank_passage(query: str, items: List[Dict[str, Any]], rerank_k: int):
         return []
     pairs = [[query, it["document"]] for it in items]
     scores = reranker.predict(pairs)
-    arr = []
     for it, s in zip(items, scores):
-        row = dict(it)
-        row["rerank_score"] = float(s)
-        arr.append(row)
-    arr.sort(key=lambda x: x["rerank_score"], reverse=True)
-    return arr[: min(rerank_k, len(arr))]
+        it["rerank_score"] = float(s)
+    items.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return items[:min(rerank_k, len(items))]
 
-def build_system_prompt() -> str:
-    return (
-        "You are a helpful assistant answering questions about US child care services. "
-        "Use the provided context excerpts to answer precisely. "
-        "If the answer is unclear, say so. "
-        "Cite the program names or document titles when relevant. "
-        "Maintain conversational awareness — references like 'it' or 'that program' "
-        "should resolve to earlier discussion when possible."
-    )
+def prepare_context_for_llm(reranked, retrieved):
+    seen_ids = {r["id"] for r in reranked}
+    diverse = [r for r in retrieved if r["id"] not in seen_ids][:3]
+    combined = reranked[:5] + diverse
 
-def build_context_block(top_docs: List[Dict[str, Any]]) -> str:
-    lines = []
-    for idx, it in enumerate(top_docs, 1):
-        meta = it.get("metadata", {}) or {}
+    seen_texts = set()
+    unique_docs = []
+    for r in combined:
+        if r["document"] not in seen_texts:
+            unique_docs.append(r)
+            seen_texts.add(r["document"])
+
+    total_text = ""
+    for d in unique_docs:
+        meta = d["metadata"]
         src = meta.get("source", "unknown")
-        state = meta.get("state", "unknown")
-        lines.append(f"[{idx}] Source: {src} · State: {state}\n{it['document']}")
-    return "\n\n".join(lines)
+        total_text += f"\n[Source: {src}]\n{d['document']}\n"
+        if len(total_text) > 12000:
+            break
+
+    return total_text.strip(), unique_docs
 
 def trim_history(history: List[ChatTurn]) -> List[ChatTurn]:
-    if not history:
-        return []
-    return history[-MAX_HISTORY_MESSAGES:]
+    return history[-MAX_HISTORY_MESSAGES:] if history else []
 
-def openai_answer(model: str, system_text: str, user_text: str, history: List[ChatTurn]) -> str:
-    messages = [{"role": "system", "content": system_text}]
+def summarize_context(history: List[ChatTurn]) -> str:
+    """Summarize the conversation context (handles ChatTurn or dict objects)."""
+    if not history:
+        return ""
+    parts = []
+    for ch in history[-5:]:
+        if isinstance(ch, dict):
+            content = ch.get("content", "")
+        else:
+            content = getattr(ch, "content", "")
+        if content:
+            parts.append(content.strip())
+    return " ".join(parts)
+
+# ==========================================================
+# 🧠 System Prompt (Enhanced)
+# ==========================================================
+SYSTEM_PROMPT = """
+You are a document-grounded assistant specializing in U.S. child-care, adoption, and administrative regulations.
+Your goal is to generate *factually correct, well-cited answers* based **only** on the provided context excerpts.
+
+Your behavior rules:
+1. Always stay faithful to the context; do NOT hallucinate.
+2. Every factual statement must include a citation like [Source: filename or section title].
+3. If multiple snippets support a claim, synthesize them smoothly into a single, coherent explanation.
+4. If information is insufficient or ambiguous, explicitly say so and suggest what document or section might clarify it.
+5. Prefer structured formatting (numbered steps, bullet points, or short paragraphs).
+6. Keep answers concise (≈300 words max).
+
+### Follow-up Guidance
+After the main answer, always produce one short **conversational follow-up question** that:
+- Is relevant to both the user's query and your answer.
+- Encourages continued exploration of the same regulation or process.
+- Is phrased naturally (e.g., “Would you like me to explain how the home study is reviewed?”)
+- Avoids repetition or trivial prompts.
+
+### Output Format
+Return your response strictly in valid JSON with this structure:
+{
+  "answer": "<well-structured factual answer with inline citations>",
+  "next_question": "<1 engaging conversational follow-up question>"
+}
+
+If data is missing, state that clearly in the answer (e.g., “The regulation does not specify this detail…”).
+Never invent citations, laws, or content not found in the given context.
+"""
+
+# ==========================================================
+# 🤖 LLM Call
+# ==========================================================
+def generate_with_next_question(model, query, context_text, history):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history:
-        role = "assistant" if h.role == "assistant" else "user"
-        messages.append({"role": role, "content": h.content})
-    messages.append({"role": "user", "content": user_text})
-    resp = oai.chat.completions.create(model=model, messages=messages, temperature=0.2)
+        messages.append({"role": h.role, "content": h.content})
+
+    context_summary = summarize_context(history) if history else ""
+    user_message = (
+        f"Question: {query}\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Summary of key snippets:\n{context_summary}\n\n"
+        "Respond strictly in valid JSON format with 'answer' and 'next_question'."
+    )
+
+    messages.append({"role": "user", "content": user_message})
+    resp = oai.chat.completions.create(model=model, messages=messages, temperature=0.3)
     return resp.choices[0].message.content.strip()
 
-# -------------------------------------------------------------
-# ROUTES
-# -------------------------------------------------------------
+# ==========================================================
+# 🌐 Routes
+# ==========================================================
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -186,34 +242,33 @@ def health():
 def chat(req: ChatRequest):
     start = time.time()
     collection = pick_collection(req.state)
-
-    # 1️⃣ Retrieve top-K from Chroma
     retrieved = retrieve(req.question, collection, top_k=req.top_k)
-
-    # 2️⃣ Rerank
     reranked = rerank_passage(req.question, retrieved, rerank_k=req.rerank_k)
+    context_text, context_docs = prepare_context_for_llm(reranked, retrieved)
 
-    # 3️⃣ Build context for the LLM
-    context_text = build_context_block(reranked)
-    user_block = (
-        f"User question:\n{req.question}\n\n"
-        "Context (top retrieved documents):\n"
-        f"{context_text if context_text else '[no context found]'}\n\n"
-        "Answer based only on this information, using prior conversation for reference if needed."
-    )
-
-    # 4️⃣ Generate final answer with history for indirect references
-    answer = openai_answer(
+    raw_output = generate_with_next_question(
         model=OPENAI_MODEL,
-        system_text=build_system_prompt(),
-        user_text=user_block,
+        query=req.question,
+        context_text=context_text,
         history=trim_history(req.history or []),
     )
 
-    sources = [{"id": it["id"], "metadata": it.get("metadata", {}), "document": it.get("document", "")}
-               for it in reranked]
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError:
+        parsed = {"answer": raw_output, "next_question": "Would you like me to expand on that?"}
 
     elapsed_ms = round((time.time() - start) * 1000)
     print(f"[chat] state={req.state} retrieved={len(retrieved)} reranked={len(reranked)} time_ms={elapsed_ms}")
 
-    return ChatResponse(answer=answer, sources=sources)
+    # Debug: top reranked docs
+    for i, r in enumerate(reranked[:3]):
+        src = r['metadata'].get('source', 'unknown')
+        score = r.get('rerank_score', 0)
+        print(f"[DEBUG] Top{i+1} ({score:.3f}) → {src}")
+
+    return ChatResponse(
+        answer=parsed.get("answer", ""),
+        next_question=parsed.get("next_question", ""),
+        sources=context_docs
+    )

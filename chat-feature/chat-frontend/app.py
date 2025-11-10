@@ -1,130 +1,112 @@
 import streamlit as st
 import requests
 import os
+import json
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 # CONFIGURATION
-# -------------------------------------------------------------------
-st.set_page_config(
-    page_title="Child Care Chat Assistant",
-    page_icon="🧸",
-    layout="centered"
-)
+# ------------------------------------------------------------
+RAG_API_URL = os.getenv("RAG_API_URL", "http://chat-backend:9100/chat")  # Adjust if backend differs
+st.set_page_config(page_title="State RAG Chatbot", page_icon="🧠", layout="centered")
 
-# Load backend URL
-CHAT_BACKEND_URL = os.getenv("CHAT_BACKEND_URL", "http://localhost:9100")
-print(f"🔗 Using backend: {CHAT_BACKEND_URL}")
-
-# -------------------------------------------------------------------
-# SESSION STATE
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# INITIALIZATION
+# ------------------------------------------------------------
+if "state" not in st.session_state:
+    st.session_state.state = None
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of {role, content}
-if "selected_state" not in st.session_state:
-    st.session_state.selected_state = None
-if "initialized" not in st.session_state:
-    st.session_state.initialized = False
+    st.session_state.messages = []
+if "api_url" not in st.session_state:
+    st.session_state.api_url = RAG_API_URL
 
-# -------------------------------------------------------------------
-# HEADER & STATE SELECTION
-# -------------------------------------------------------------------
-st.title("🏫 Unified Child Care Chatbot")
-st.caption("Ask any question about child care programs — the assistant remembers your context!")
+# ------------------------------------------------------------
+# STEP 1: SELECT STATE
+# ------------------------------------------------------------
+if st.session_state.state is None:
+    st.title("🗺️ State Knowledge Chatbot")
 
-if not st.session_state.initialized:
-    try:
-        # Optional health check
-        health = requests.get(f"{CHAT_BACKEND_URL}/health", timeout=5)
-        if health.status_code == 200:
-            st.session_state.initialized = True
-    except Exception as e:
-        st.error(f"❌ Backend not reachable: {e}")
-        st.stop()
+    st.markdown("### Select which state’s dataset you want to interact with")
+    st.write("Each state corresponds to its child-care and adoption regulation dataset stored in ChromaDB.")
 
-# Let user pick a state before chatting
-states = ["California", "New York"]
-st.subheader("Select a State")
-selected_state = st.radio(
-    "Which state are you asking about?",
-    options=states,
-    index=0,
-    horizontal=True
-)
-st.session_state.selected_state = selected_state
+    state_option = st.selectbox("Choose a state", ["California", "New York"])
+    if st.button("Start Chat"):
+        st.session_state.state = state_option
+        st.rerun()
+else:
+    # ------------------------------------------------------------
+    # STEP 2: MAIN CHAT INTERFACE
+    # ------------------------------------------------------------
+    st.title(f"💬 Chat with the Assistant ({st.session_state.state})")
+    st.caption("Ask any question based on the uploaded state regulation PDFs. The assistant will respond with citations and follow-up suggestions.")
 
-st.markdown("---")
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-# -------------------------------------------------------------------
-# CHAT UI
-# -------------------------------------------------------------------
-st.subheader("💬 Chat with the Assistant")
-
-# Display chat history
-for msg in st.session_state.messages:
-    if msg["role"] == "user":
+    # ------------------------------------------------------------
+    # User Input
+    # ------------------------------------------------------------
+    if prompt := st.chat_input("Type your question here..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.markdown(msg["content"])
-    else:
-        with st.chat_message("assistant"):
-            st.markdown(msg["content"])
+            st.markdown(prompt)
 
-# Prompt input box
-if prompt := st.chat_input("Type your question here..."):
-    # Append user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Prepare payload for backend
-    payload = {
-        "question": prompt,
-        "state": st.session_state.selected_state,
-        "history": st.session_state.messages[-10:],  # last 10 for context
-    }
-
-    with st.spinner("🤔 Thinking..."):
+        # ------------------------------------------------------------
+        # Backend Request
+        # ------------------------------------------------------------
         try:
-            resp = requests.post(f"{CHAT_BACKEND_URL}/chat", json=payload, timeout=60)
-            if resp.status_code == 200:
-                data = resp.json()
-                answer = data.get("answer", "No answer found.")
+            with st.spinner("Retrieving relevant context and generating response..."):
+                history_payload = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages[-10:]
+                ]
+
+                payload = {
+                    "question": prompt,
+                    "state": st.session_state.state,
+                    "history": history_payload
+                }
+
+                response = requests.post(st.session_state.api_url, json=payload, timeout=120)
+                response.raise_for_status()
+                data = response.json()
+
+                answer = data.get("answer", "⚠️ No answer returned.")
+                next_question = data.get("next_question", "")
                 sources = data.get("sources", [])
 
-                # Format answer neatly
-                with st.chat_message("assistant"):
-                    st.markdown(answer)
+        except requests.exceptions.RequestException as e:
+            answer = f"❌ Request failed: {e}"
+            next_question = ""
+            sources = []
 
-                    if sources:
-                        with st.expander("📚 View Sources"):
-                            for i, src in enumerate(sources, 1):
-                                meta = src.get("metadata", {})
-                                src_name = meta.get("source", "unknown")
-                                st.markdown(f"**{i}. {src_name}**")
-                                st.caption(meta)
-                # Append assistant response
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+        # ------------------------------------------------------------
+        # Display Assistant Message
+        # ------------------------------------------------------------
+        with st.chat_message("assistant"):
+            st.markdown(answer)
 
-            else:
-                st.error(f"❌ Backend error: {resp.status_code}")
-        except requests.exceptions.ConnectionError:
-            st.error("⚠️ Could not reach chat backend. Make sure it’s running.")
-        except Exception as e:
-            st.error(f"Unexpected error: {str(e)}")
+            if next_question:
+                st.markdown("---")
+                st.markdown(f"**💭 Next possible question:** {next_question}")
 
-# -------------------------------------------------------------------
-# CLEAR CHAT OPTION
-# -------------------------------------------------------------------
-if st.button("🧹 Clear Chat"):
-    st.session_state.messages = []
-    st.experimental_rerun()
+            if sources:
+                with st.expander("📚 View Sources"):
+                    for src in sources:
+                        meta = src.get("metadata", {})
+                        st.markdown(f"- **{meta.get('source', 'unknown')}**")
 
-# -------------------------------------------------------------------
-# FOOTER
-# -------------------------------------------------------------------
-st.markdown("---")
-st.markdown(
-    "<div style='text-align:center; color:#777;'>"
-    "💡 <b>Tip:</b> The assistant remembers the last few messages to keep context!"
-    "</div>",
-    unsafe_allow_html=True
-)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+
+    # ------------------------------------------------------------
+    # Sidebar Controls
+    # ------------------------------------------------------------
+    st.sidebar.title("⚙️ Controls")
+    if st.sidebar.button("Clear Chat"):
+        st.session_state.messages = []
+        st.rerun()
+
+    if st.sidebar.button("Change State"):
+        st.session_state.state = None
+        st.session_state.messages = []
+        st.rerun()
