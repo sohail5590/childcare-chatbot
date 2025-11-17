@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict
 
 import chromadb
 from chromadb.config import Settings
@@ -15,10 +15,42 @@ import requests
 # import psycopg2
 import os
 import shutil
+import json
 from pathlib import Path
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Load configuration file
+CONFIG_FILE = Path("/app/config.json")
+state_config = {}
+state_collections = {}
+
+def load_config():
+    """Load states configuration from config.json"""
+    global state_config, state_collections
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, 'r') as f:
+                config_data = json.load(f)
+                state_config = {state['name']: state['collection_name'] for state in config_data['states']}
+                print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
+        else:
+            # Fallback to hardcoded states if config doesn't exist
+            state_config = {
+                "California": "california_state",
+                "New York": "newyork_state"
+            }
+            print("[CONFIG] Using default states (config.json not found)", flush=True)
+    except Exception as e:
+        print(f"[CONFIG ERROR] Failed to load config: {e}", flush=True)
+        state_config = {
+            "California": "california_state",
+            "New York": "newyork_state"
+        }
+
+# Load config on startup
+load_config()
 
 # Base directory for storing uploaded files
 DATA_DIR = Path("/app/Data")
@@ -27,9 +59,15 @@ DATA_DIR.mkdir(exist_ok=True)
 # Initialize ChromaDB client - Connect to ChromaDB container
 chroma_client = chromadb.HttpClient(host='chromodb', port=8000)
 
-# Create or get collections for both states
-collection_california = chroma_client.get_or_create_collection(name="california_state")
-collection_newyork = chroma_client.get_or_create_collection(name="newyork_state")
+# Create or get collections dynamically based on config
+for state_name, collection_name in state_config.items():
+    try:
+        state_collections[state_name] = chroma_client.get_or_create_collection(name=collection_name)
+        print(f"[COLLECTION] Created/loaded collection: {collection_name} for state: {state_name}", flush=True)
+    except Exception as e:
+        print(f"[COLLECTION ERROR] Failed to create collection for {state_name}: {e}", flush=True)
+
+# Create QA pairs collection
 qa_collection_california = chroma_client.get_or_create_collection(name="qa_pairs")
 
 # Load embedding model
@@ -59,10 +97,79 @@ class VectorizeRequest(BaseModel):
 OLLAMA_URL = "http://ollama:11434/api/generate"
 OLLAMA_MODEL = "llama3.1:8b"
 
-# Endpoint for Login (Placeholder)
+# Endpoint to get available states
+@app.get("/states")
+async def get_states():
+    """
+    Get list of available states from configuration.
+    Returns list of state names that can be used for upload and queries.
+    """
+    try:
+        return JSONResponse(
+            content={
+                "states": list(state_config.keys()),
+                "count": len(state_config)
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+# Endpoint for Login
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 @app.post("/login")
-async def login():
-    pass
+async def login(request: LoginRequest):
+    """
+    Authenticate user with username and password.
+    Returns success status and user information.
+    """
+    try:
+        username = request.username
+        password = request.password
+        
+        print(f"[LOGIN] Login attempt for user: {username}")
+        
+        # TODO: Replace with actual authentication logic (database, OAuth, etc.)
+        # For now, using simple demo credentials
+        if username == "admin" and password == "admin123":
+            print(f"[LOGIN] Successful login for user: {username}")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Login successful",
+                    "user": {
+                        "username": username,
+                        "role": "admin"
+                    }
+                }
+            )
+        else:
+            print(f"[LOGIN] Failed login attempt for user: {username}")
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "success": False,
+                    "message": "Invalid username or password"
+                }
+            )
+    
+    except Exception as e:
+        print(f"[LOGIN ERROR] {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": f"Login failed: {str(e)}"
+            }
+        )
 
 
 # ==================== INSPECTION ENDPOINTS ====================
@@ -333,16 +440,13 @@ async def vectorize_documents(request: VectorizeRequest):
         print(f"[VECTORIZE] Processing {len(file_paths)} files for state: {state}")
         
         # Select appropriate collection based on state
-        if state.lower() == "california":
-            collection = collection_california
-        elif state.lower() == "new york":
-            collection = collection_newyork
-        else:
+        if state not in state_collections:
             return JSONResponse(
                 status_code=400,
-                content={"error": f"Invalid state: {state}"}
+                content={"error": f"Invalid state: {state}. Valid states: {list(state_collections.keys())}"}
             )
         
+        collection = state_collections[state]
         print(f"[VECTORIZE] Using collection: {collection.name}")
         
         total_chunks = 0

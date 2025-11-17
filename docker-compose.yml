@@ -8,6 +8,7 @@ services:
     volumes:
       - ./Backend:/app
       - ./Data:/app/Data
+      - ./config.json:/app/config.json
     depends_on:
       - chromodb
       # - ollama
@@ -19,6 +20,7 @@ services:
       - "8501:8501"
     volumes:
       - ./Frontend:/app
+      - ./config.json:/app/config.json
     depends_on:
       - backend
   chromodb:
