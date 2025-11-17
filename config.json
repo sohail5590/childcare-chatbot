@@ -1,0 +1,16 @@
+{
+    "states": [
+      {
+        "name": "California",
+        "collection_name": "california_state"
+      },
+      {
+        "name": "New York",
+        "collection_name": "newyork_state"
+      },
+      {
+        "name": "Utah",
+        "collection_name": "utah_state"
+      }
+    ]
+  }  
