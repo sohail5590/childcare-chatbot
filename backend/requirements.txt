@@ -2,6 +2,16 @@ fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
+chromadb
+sentence-transformers
+python-multipart
+langchain
+langchain-community
+pypdf
+PyPDF2
+python-docx
+pandas
+langchain_text_splitters
 
 # Added for data ingestion and vectorization
 pandas
