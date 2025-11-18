@@ -11,6 +11,10 @@
       {
         "name": "Utah",
         "collection_name": "utah_state"
+      },
+      {
+        "name": "Kentucky",
+        "collection_name": "kentucky_state"
       }
     ]
   }  
