@@ -59,7 +59,18 @@ DATA_DIR = Path("/app/Data")
 DATA_DIR.mkdir(exist_ok=True)
 
 # Initialize ChromaDB client - Connect to ChromaDB container
-chroma_client = chromadb.HttpClient(host='chromodb', port=8000)
+# chroma_client = chromadb.HttpClient(host='chromadb', port=8000)
+for attempt in range(10):
+    try:
+        chroma_client = chromadb.HttpClient(host="chromadb", port=8000)
+        # Quick sanity check to verify API is responsive
+        if chroma_client.heartbeat():
+            print("✅ Connected to ChromaDB!")
+            break
+        else:
+            time.sleep(5)        
+else:
+    raise RuntimeError("❌ Could not connect to ChromaDB after multiple retries.")
 
 # Create or get collections dynamically based on config
 for state_name, collection_name in state_config.items():
