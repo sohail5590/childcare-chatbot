@@ -17,6 +17,22 @@ import json
 from pathlib import Path
 import time
 import traceback
+import re
+import requests
+
+from openai import OpenAI
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent  # adjust based on your directory
+env_path = PROJECT_ROOT / ".env"
+
+if env_path.exists():
+    load_dotenv(env_path)
+    print(f"Loaded environment from {env_path}")
+else:
+    print(f".env not found at {env_path}")
 
 # =========================================================
 # Initialize FastAPI app
@@ -29,7 +45,6 @@ state_config = {}
 state_collections = {}
 
 def load_config():
-    """Load states configuration from config.json"""
     global state_config, state_collections
     try:
         if CONFIG_FILE.exists():
@@ -38,53 +53,59 @@ def load_config():
                 state_config = {state['name']: state['collection_name'] for state in config_data['states']}
                 print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
         else:
-            # Fallback to hardcoded states if config doesn't exist
             state_config = {
                 "California": "california_state",
                 "New York": "newyork_state"
             }
             print("[CONFIG] Using default states (config.json not found)", flush=True)
     except Exception as e:
-        print(f"[CONFIG ERROR] Failed to load config: {e}", flush=True)
+        print(f"[CONFIG ERROR] {e}", flush=True)
         state_config = {
             "California": "california_state",
             "New York": "newyork_state"
         }
 
-# Load config on startup
 load_config()
 
-# Base directory for storing uploaded files
+# =========================================================
+# OpenAI client
+# =========================================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+oai = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_LLM_MODEL = "gpt-4o-mini"
+
+# =========================================================
+# Base directory for uploads
+# =========================================================
 DATA_DIR = Path("/app/Data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Initialize ChromaDB client - Connect to ChromaDB container
-# chroma_client = chromadb.HttpClient(host='chromadb', port=8000)
-for attempt in range(10):
-    try:
+# =========================================================
+# Connect to ChromaDB
+# =========================================================
+try:
+    for attempt in range(10):
         chroma_client = chromadb.HttpClient(host="chromadb", port=8000)
-        # Quick sanity check to verify API is responsive
         if chroma_client.heartbeat():
             print("✅ Connected to ChromaDB!")
             break
-        else:
-            time.sleep(5)        
-else:
-    raise RuntimeError("❌ Could not connect to ChromaDB after multiple retries.")
+        time.sleep(5)
+except Exception as e:
+    raise RuntimeError("❌ Could not connect to ChromaDB.", str(e))
 
-# Create or get collections dynamically based on config
+# Create state collections
 for state_name, collection_name in state_config.items():
     try:
         state_collections[state_name] = chroma_client.get_or_create_collection(name=collection_name)
-        print(f"[COLLECTION] Created/loaded collection: {collection_name} for state: {state_name}", flush=True)
+        print(f"[COLLECTION] Ready: {collection_name}")
     except Exception as e:
-        print(f"[COLLECTION ERROR] Failed to create collection for {state_name}: {e}", flush=True)
+        print(f"[COLLECTION ERROR] {e}", flush=True)
 
-# Create QA pairs collection
+# QA collection
 qa_collection_california = chroma_client.get_or_create_collection(name="qa_pairs")
 
 # =========================================================
-# Embedding model & text splitter
+# Embedding model & splitter
 # =========================================================
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -109,29 +130,170 @@ class VectorizeRequest(BaseModel):
     state: str
     file_paths: List[str]
 
-# Ollama endpoint
-OLLAMA_URL = "http://ollama:11434/api/generate"
-OLLAMA_MODEL = "llama3.1:8b"
+# =========================================================
+# Category labels
+# =========================================================
+CATEGORY_LABELS = [
+    "definition",
+    "requirement",
+    "procedure",
+    "statistic",
+    "benefit",
+    "challenge",
+    "feature",
+    "comparison"
+]
 
-# Endpoint to get available states
-@app.get("/states")
-async def get_states():
-    """
-    Get list of available states from configuration.
-    Returns list of state names that can be used for upload and queries.
-    """
+# =========================================================
+# Heuristic scoring functions
+# =========================================================
+def heuristic_category_scores(text: str) -> Dict[str, int]:
+    t = text.lower()
+    scores = {cat: 0 for cat in CATEGORY_LABELS}
+
+    # Definitions
+    definition_keywords = [
+        "is defined as", "refers to", "means", "defined as",
+        "in this section,", "for the purposes of"
+    ]
+
+    # Statistic
+    statistic_patterns = [r"\b\d{1,3}%\b"]
+    statistic_keywords = [
+        "percent", "percentage", "ratio", "figure", "table", "chart",
+        "survey", "data", "results", "average", "median", "mean", "distribution"
+    ]
+
+    # Requirement
+    requirement_keywords = [
+        "must", "shall", "required", "mandatory", "shall not",
+        "must not", "compliance", "regulation", "rule", "criteria", "eligibility"
+    ]
+
+    # Procedure
+    procedure_keywords = [
+        "steps", "step", "process", "procedure", "workflow",
+        "sequence", "how to", "instructions", "method", "stage", "phase"
+    ]
+
+    # Benefit
+    benefit_keywords = [
+        "benefit", "advantage", "improves", "increases", "reduces",
+        "helps", "enhances", "positive outcome", "gain"
+    ]
+
+    # Challenge
+    challenge_keywords = [
+        "challenge", "difficulty", "problem", "issue", "barrier",
+        "concern", "hard to", "struggle", "limitation"
+    ]
+
+    # Feature
+    feature_keywords = [
+        "feature", "characteristic", "attribute", "property",
+        "type", "category", "includes", "consists of"
+    ]
+
+    # Comparison
+    comparison_keywords = [
+        "compared to", "versus", "vs", "difference",
+        "similarity", "in contrast", "better than", "worse than"
+    ]
+
+    for kw in definition_keywords:
+        if kw in t:
+            scores["definition"] += 2
+
+    for pattern in statistic_patterns:
+        if re.search(pattern, t):
+            scores["statistic"] += 3
+    for kw in statistic_keywords:
+        if kw in t:
+            scores["statistic"] += 1
+
+    for kw in requirement_keywords:
+        if kw in t:
+            scores["requirement"] += 1
+
+    for kw in procedure_keywords:
+        if kw in t:
+            scores["procedure"] += 1
+
+    for kw in benefit_keywords:
+        if kw in t:
+            scores["benefit"] += 1
+
+    for kw in challenge_keywords:
+        if kw in t:
+            scores["challenge"] += 1
+
+    for kw in feature_keywords:
+        if kw in t:
+            scores["feature"] += 1
+
+    for kw in comparison_keywords:
+        if kw in t:
+            scores["comparison"] += 1
+
+    return scores
+
+def normalize_scores(scores: Dict[str, int]) -> Dict[str, float]:
+    if not scores:
+        return {}
+    max_score = max(scores.values())
+    if max_score == 0:
+        return {}
+    return {k: round(v / max_score, 3) for k, v in scores.items() if v > 0}
+
+# =========================================================
+# LLM fallback (OpenAI)
+# =========================================================
+def llm_category_fallback(text: str) -> Dict[str, float]:
     try:
-        return JSONResponse(
-            content={
-                "states": list(state_config.keys()),
-                "count": len(state_config)
-            }
+        labels_str = ", ".join(CATEGORY_LABELS)
+        prompt = (
+            "Classify the following text into one or more categories.\n"
+            f"Valid categories: {labels_str}.\n"
+            "Return a comma-separated list.\n\n"
+            f"Text:\n{text[:4000]}\n\n"
+            "Categories:"
         )
+
+        resp = oai.chat.completions.create(
+            model=OPENAI_LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        raw = resp.choices[0].message["content"].lower().strip()
+
+        if not raw:
+            return {}
+
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        result = {p: 1.0 for p in parts if p in CATEGORY_LABELS}
+
+        return result
+
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+        print(f"[OPENAI FALLBACK ERROR] {e}", flush=True)
+        return {}
+
+# =========================================================
+# Combined classifier
+# =========================================================
+def get_chunk_categories(text: str) -> Dict[str, float]:
+    scores = heuristic_category_scores(text)
+    normalized = normalize_scores(scores)
+
+    if normalized:
+        return normalized
+
+    llm_result = llm_category_fallback(text)
+    if llm_result:
+        return llm_result
+
+    return {"other": 1.0}
 
 # Endpoint for Login
 class LoginRequest(BaseModel):
@@ -188,164 +350,142 @@ async def login(request: LoginRequest):
         )
 
 
-# ==================== INSPECTION ENDPOINTS ====================
 
 # =========================================================
 # INSPECTION ENDPOINTS
 # =========================================================
-@app.get("/collections")
-async def get_collections():
+@app.get("/states")
+async def get_states():
     try:
-        collections = chroma_client.list_collections()
-        result = []
-        for col in collections:
-            collection = chroma_client.get_collection(col.name)
-            count = collection.count()
-            sample_data = None
-            if count > 0:
-                peek_data = collection.peek(limit=3)
-                sample_data = {
-                    "documents": peek_data.get("documents", []),
-                    "metadatas": peek_data.get("metadatas", []),
-                    "ids": peek_data.get("ids", []),
-                }
-            result.append({
-                "name": col.name,
-                "document_count": count,
-                "sample_data": sample_data
-            })
-        return JSONResponse(status_code=200, content={
-            "total_collections": len(result),
-            "collections": result
-        })
+        return {"states": list(state_config.keys()), "count": len(state_config)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.get("/collections")
+async def get_collections():
+    try:
+        cols = chroma_client.list_collections()
+        result = []
+        for col in cols:
+            c = chroma_client.get_collection(col.name)
+            cnt = c.count()
+            peek = None
+            if cnt > 0:
+                pdata = c.peek(limit=3)
+                peek = {
+                    "documents": pdata.get("documents", []),
+                    "metadatas": pdata.get("metadatas", []),
+                    "ids": pdata.get("ids", []),
+                }
+            result.append({"name": col.name, "count": cnt, "sample": peek})
+        return {"collections": result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # =========================================================
-# UPLOAD DOCUMENTS
+# UPLOAD
 # =========================================================
 @app.post("/upload")
 async def upload_documents(files: List[UploadFile] = File(...), state: str = Form(...)):
     try:
-        print(f"[UPLOAD] Received {len(files)} files for state: {state}")
         state_dir = state.lower().replace(" ", "_")
         upload_dir = DATA_DIR / state_dir
-        upload_dir.mkdir(exist_ok=True, parents=True)
-        saved_files = []
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-        for file in files:
-            file_path = upload_dir / file.filename
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            print(f"[UPLOAD] Saved file: {file_path}")
-            saved_files.append(str(file_path))
+        saved = []
 
-        return JSONResponse(status_code=200, content={
-            "message": f"Successfully uploaded {len(saved_files)} file(s)",
-            "file_paths": saved_files,
-            "state": state
-        })
+        for f in files:
+            dest = upload_dir / f.filename
+            with open(dest, "wb") as buffer:
+                shutil.copyfileobj(f.file, buffer)
+            saved.append(str(dest))
+
+        return {"message": "Uploaded", "file_paths": saved, "state": state}
+
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-
 # =========================================================
-# VECTORIZE DOCUMENTS
+# VECTORIZE (FINAL)
 # =========================================================
 @app.post("/vectorize")
 async def vectorize_documents(request: VectorizeRequest):
     try:
         state = request.state
-        file_paths = request.file_paths
-        print(f"[VECTORIZE] Processing {len(file_paths)} files for state: {state}")
-        
-        # Select appropriate collection based on state
+        fpaths = request.file_paths
+
         if state not in state_collections:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid state: {state}. Valid states: {list(state_collections.keys())}"}
-            )
-        
+            return {"error": f"Invalid state: {state}"}
+
         collection = state_collections[state]
-        print(f"[VECTORIZE] Using collection: {collection.name}")
-        
+
         total_chunks = 0
-        processed_files = []
+        done_files = []
 
-        for file_path in file_paths:
-            file_path_obj = Path(file_path)
-            if not file_path_obj.exists():
-                print(f"[VECTORIZE] File not found: {file_path}")
+        for fp in fpaths:
+            p = Path(fp)
+            if not p.exists():
+                print(f"[VECTORIZE] File missing: {fp}")
                 continue
 
-            ext = file_path_obj.suffix.lower()
+            ext = p.suffix.lower()
             if ext == ".pdf":
-                loader = PyPDFLoader(str(file_path_obj))
-            elif ext in [".docx", ".doc"]:
-                loader = UnstructuredWordDocumentLoader(str(file_path_obj))
+                loader = PyPDFLoader(str(p))
+            elif ext in [".doc", ".docx"]:
+                loader = UnstructuredWordDocumentLoader(str(p))
             elif ext == ".csv":
-                loader = CSVLoader(str(file_path_obj))
+                loader = CSVLoader(str(p))
             elif ext == ".txt":
-                loader = TextLoader(str(file_path_obj))
+                loader = TextLoader(str(p))
             else:
-                print(f"[VECTORIZE] Unsupported file type: {ext}")
+                print(f"[VECTORIZE] Unsupported: {ext}")
                 continue
 
-            print(f"[VECTORIZE] Loading {file_path_obj.name} ...")
-            documents = loader.load()
-            chunks = text_splitter.split_documents(documents)
-            print(f"[VECTORIZE] Split into {len(chunks)} chunks")
+            docs = loader.load()
+            chunks = text_splitter.split_documents(docs)
 
             for i, chunk in enumerate(chunks):
-                embedding = model.encode(chunk.page_content).tolist()
-                doc_id = f"{file_path_obj.stem}_chunk_{i}_{total_chunks}"
+                text = chunk.page_content
+
+                categories = get_chunk_categories(text)
+                categories_json = json.dumps(categories)  # FIX for Chroma
+
+                emb = model.encode(text).tolist()
+
+                doc_id = f"{p.stem}_chunk_{i}_{total_chunks}"
+
                 collection.add(
-                    embeddings=[embedding],
-                    documents=[chunk.page_content],
+                    embeddings=[emb],
+                    documents=[text],
                     metadatas=[{
-                        "source": file_path_obj.name,
+                        "source": p.name,
                         "state": state,
                         "chunk_index": i,
-                        "file_type": ext
+                        "file_type": ext,
+                        "categories": categories_json
                     }],
                     ids=[doc_id]
                 )
+
                 total_chunks += 1
 
-            processed_files.append(file_path_obj.name)
-            print(f"[VECTORIZE] ✅ Completed: {file_path_obj.name}")
+            done_files.append(p.name)
 
-        print(f"[VECTORIZE] Total chunks stored: {total_chunks}")
-        print(f"[VECTORIZE] Collection count (after insert): {collection.count()}")
-
-        # 🟩 Peek into stored chunks
-        if collection.count() > 0:
-            peek_data = collection.peek(limit=3)
-            print("\n[DEBUG] Sample stored documents:")
-            for i, doc in enumerate(peek_data.get("documents", [])):
-                print(f"--- Chunk {i+1} ---")
-                print(doc[:300].replace("\n", " "))
-                print("Metadata:", peek_data["metadatas"][i])
-                print()
-
-        return JSONResponse(status_code=200, content={
-            "message": f"Successfully vectorized {len(processed_files)} file(s)",
+        return {
+            "message": "Vectorization complete",
+            "processed_files": done_files,
             "total_chunks": total_chunks,
-            "processed_files": processed_files,
-            "state": state,
             "collection_count": collection.count()
-        })
+        }
 
     except Exception as e:
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": f"Vectorization failed: {str(e)}"})
-
+        return {"error": str(e)}
 
 # =========================================================
-# Placeholder for /ask
+# Placeholder /ask
 # =========================================================
 @app.post("/ask")
 async def ask_question(request: QuestionRequest):
-    return {"message": "Question endpoint placeholder"}
+    return {"message": "placeholder"}
