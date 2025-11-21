@@ -46,7 +46,6 @@ else:
     st.title(f"💬 Chat with the Assistant ({st.session_state.state})")
     st.caption("Ask questions about childcare & adoption regulations. All answers are grounded in your state's documents.")
 
-    # Render conversation
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -55,14 +54,10 @@ else:
     # USER INPUT
     # ------------------------------------------------------------
     if prompt := st.chat_input("Type your question here..."):
-        # Display user message immediately
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # ------------------------------------------------------------
-        # BACKEND CALL
-        # ------------------------------------------------------------
         try:
             with st.spinner("Retrieving context and generating answer..."):
                 history_payload = [
@@ -77,27 +72,21 @@ else:
                     "last_followup_question": st.session_state.last_followup_question
                 }
 
-                response = requests.post(
-                    st.session_state.api_url, 
-                    json=payload, 
-                    timeout=120
-                )
+                response = requests.post(st.session_state.api_url, json=payload, timeout=120)
                 response.raise_for_status()
                 data = response.json()
 
                 answer = data.get("answer", "⚠️ No answer returned.")
                 next_q = data.get("next_question", "")
                 sources = data.get("sources", [])
-                classification = data.get("classification", "new_query")
 
         except requests.exceptions.RequestException as e:
             answer = f"❌ Request failed: {e}"
             next_q = ""
             sources = []
-            classification = "error"
 
         # ------------------------------------------------------------
-        # FORMAT ASSISTANT MESSAGE (Answer + Follow-up)
+        # FORMAT ASSISTANT ANSWER
         # ------------------------------------------------------------
         combined = answer
         if next_q:
@@ -112,13 +101,7 @@ else:
                         meta = src.get("metadata", {})
                         st.markdown(f"- **{meta.get('source', 'unknown')}**")
 
-        # Store in session
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": combined
-        })
-
-        # Store follow-up question to send for classification next turn
+        st.session_state.messages.append({"role": "assistant", "content": combined})
         st.session_state.last_followup_question = next_q
 
     # ------------------------------------------------------------

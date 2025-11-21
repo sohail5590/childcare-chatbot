@@ -1,9 +1,9 @@
 version: "3.9"
 
 services:
-  # ---------------------------------------------------
-  # 1️⃣ ChromaDB (shared vector store)
-  # ---------------------------------------------------
+  # ========================================
+  # 1️⃣ ChromaDB (Vector Store)
+  # ========================================
   chromadb:
     image: ghcr.io/chroma-core/chroma:latest
     container_name: rag_ccb_chromadb
@@ -11,7 +11,7 @@ services:
       - "8000:8000"
     volumes:
       - chromadb_data:/chroma/chroma
-      - ./Data:/app/Data               # ✅ persistent vector store
+      - ./Data:/app/Data
     environment:
       - IS_PERSISTENT=TRUE
       - PERSIST_DIRECTORY=/chroma/chroma
@@ -23,34 +23,36 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # ---------------------------------------------------
-  # 2️⃣ Ingestion / Upload Backend
-  # ---------------------------------------------------
+  # ========================================
+  # 2️⃣ Ingestion Backend (Uploads + Vectorization)
+  # ========================================
   backend:
     build:
       context: ./backend
     container_name: rag_ccb_backend
     ports:
       - "9000:9000"
+    working_dir: /app/backend
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend              # mount backend code ONLY
       - ./Data:/app/Data
       - ./config.json:/app/config.json
-      - chromadb_data:/chroma/chroma               # ✅ share Chroma persistent volume
+      - chromadb_data:/chroma/chroma
+    env_file:
+      - .env
     environment:
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
-      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - PYTHONUNBUFFERED=1
+      - HF_HUB_DISABLE_SSL_VERIFICATION=1
     depends_on:
       chromadb:
         condition: service_healthy
     restart: unless-stopped
 
-  # ---------------------------------------------------
-  # 3️⃣ Document Upload / Admin Frontend
-  # ---------------------------------------------------
+  # ========================================
+  # 3️⃣ Admin Frontend (for uploading documents)
+  # ========================================
   frontend:
     build:
       context: ./frontend
@@ -58,16 +60,16 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./config.json:/app/config.json
       - ./frontend:/app
+      - ./config.json:/app/config.json
     depends_on:
       backend:
         condition: service_started
     restart: unless-stopped
 
-  # ---------------------------------------------------
+  # ========================================
   # 4️⃣ Chat Backend (FastAPI + Re-ranker)
-  # ---------------------------------------------------
+  # ========================================
   chat-backend:
     build:
       context: ./chat-feature/chat-backend
@@ -78,22 +80,23 @@ services:
       - ./chat-feature/chat-backend:/app
       - ./Data:/app/Data
       - ./hf_cache:/app/.hf_cache
-      - chromadb_data:/chroma/chroma               # ✅ same volume for read consistency
+      - chromadb_data:/chroma/chroma
     env_file:
       - .env
     environment:
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
       - PYTHONUNBUFFERED=1
+      - HF_HUB_DISABLE_SSL_VERIFICATION=1
     depends_on:
       chromadb:
         condition: service_healthy
     command: uvicorn main:app --host 0.0.0.0 --port 9100 --reload
     restart: unless-stopped
 
-  # ---------------------------------------------------
-  # 5️⃣ Chat Frontend (Streamlit Chat UI)
-  # ---------------------------------------------------
+  # ========================================
+  # 5️⃣ Chat Frontend (Streamlit UI)
+  # ========================================
   chat-frontend:
     build:
       context: ./chat-feature/chat-frontend
@@ -107,7 +110,7 @@ services:
     environment:
       - STREAMLIT_SERVER_PORT=8501
       - STREAMLIT_SERVER_HEADLESS=true
-      - CHAT_BACKEND_URL=http://chat-backend:9100  # ✅ ensures internal container calls
+      - CHAT_BACKEND_URL=http://chat-backend:9100
     depends_on:
       chat-backend:
         condition: service_started
