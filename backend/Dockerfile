@@ -1,12 +1,15 @@
-# Use an official lightweight Python image as a base
+# ================================
+# Backend Dockerfile (Clean + Fixed)
+# ================================
 FROM python:3.11-slim
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
-# Set the working directory inside the container to /app
-WORKDIR /app
 
-# Copy the requirements file into the container first
-# This leverages Docker's layer caching, speeding up future builds if dependencies don't change
+# Working directory for your backend
+WORKDIR /app/backend
+
+# Install dependencies needed for HF + SentenceTransformers
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
@@ -15,27 +18,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Add Zscaler certificate
 COPY zscalar-root.crt /usr/local/share/ca-certificates/zscalar-root.crt
 RUN update-ca-certificates
-COPY requirements.txt .
 
+# Copy requirements first (for Docker caching)
+COPY requirements.txt /app/backend/requirements.txt
+
+# Install dependencies
 RUN pip install --no-cache-dir \
     --trusted-host pypi.org \
     --trusted-host pypi.python.org \
     --trusted-host files.pythonhosted.org \
     -r requirements.txt
 
-# Copy the rest of the application's source code into the container
-COPY . .
+# Copy your backend source code ONLY
+COPY . /app/backend
 
-# Expose port 8000 to allow communication with the API server from other containers
-# Port will be 9000
-# EXPOSE 8000
+# Environment variable for HF SSL fix
+ENV HF_HUB_DISABLE_SSL_VERIFICATION=1
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-# The command to run when the container starts
-# This starts the Uvicorn server, which runs the FastAPI application
-# --host 0.0.0.0: Makes the server accessible from outside the container
-# --reload: Automatically restarts the server when code changes are detected (great for development)
-# CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-
+# Run backend
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9000", "--reload"]
