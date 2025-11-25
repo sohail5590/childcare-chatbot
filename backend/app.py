@@ -1,14 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Any
 
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
-from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    CSVLoader,
+    UnstructuredWordDocumentLoader,
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import os
@@ -18,95 +22,114 @@ from pathlib import Path
 import time
 import traceback
 import re
-import requests
 
 from openai import OpenAI
-
 from dotenv import load_dotenv
 
+# =========================================================
+# Base Paths & Environment
+# =========================================================
+
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent  # adjust based on your directory
-env_path = PROJECT_ROOT / ".env"
+PROJECT_ROOT = BASE_DIR.parent
+ENV_PATH = PROJECT_ROOT / ".env"
 
-if env_path.exists():
-    load_dotenv(env_path)
-    print(f"Loaded environment from {env_path}")
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+    print(f"Loaded .env from {ENV_PATH}")
 else:
-    print(f".env not found at {env_path}")
+    print(f".env not found at {ENV_PATH}")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+oai = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_LLM_MODEL = "gpt-4o-mini"
 
 # =========================================================
-# Initialize FastAPI app
+# FastAPI App
 # =========================================================
+
 app = FastAPI()
 
-# Load configuration file
+# =========================================================
+# Config Loader
+# =========================================================
+
 CONFIG_FILE = Path("/app/config.json")
-state_config = {}
-state_collections = {}
+state_config: Dict[str, str] = {}
+state_collections: Dict[str, Any] = {}
+
 
 def load_config():
+    """
+    Load state -> collection_name mapping from config.json.
+    Falls back to California/New York if file missing or invalid.
+    """
     global state_config, state_collections
     try:
         if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, 'r') as f:
-                config_data = json.load(f)
-                state_config = {state['name']: state['collection_name'] for state in config_data['states']}
-                print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+                state_config = {
+                    st["name"]: st["collection_name"]
+                    for st in cfg.get("states", [])
+                    if "name" in st and "collection_name" in st
+                }
+            print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
         else:
             state_config = {
                 "California": "california_state",
-                "New York": "newyork_state"
+                "New York": "newyork_state",
             }
             print("[CONFIG] Using default states (config.json not found)", flush=True)
     except Exception as e:
         print(f"[CONFIG ERROR] {e}", flush=True)
         state_config = {
             "California": "california_state",
-            "New York": "newyork_state"
+            "New York": "newyork_state",
         }
+
 
 load_config()
 
 # =========================================================
-# OpenAI client
+# Storage Paths
 # =========================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-oai = OpenAI(api_key=OPENAI_API_KEY)
-OPENAI_LLM_MODEL = "gpt-4o-mini"
 
-# =========================================================
-# Base directory for uploads
-# =========================================================
 DATA_DIR = Path("/app/Data")
 DATA_DIR.mkdir(exist_ok=True)
 
 # =========================================================
-# Connect to ChromaDB
+# ChromaDB Connection
 # =========================================================
+
 try:
     for attempt in range(10):
         chroma_client = chromadb.HttpClient(host="chromadb", port=8000)
         if chroma_client.heartbeat():
             print("✅ Connected to ChromaDB!")
             break
-        time.sleep(5)
+        print("Waiting for ChromaDB...")
+        time.sleep(3)
 except Exception as e:
-    raise RuntimeError("❌ Could not connect to ChromaDB.", str(e))
+    raise RuntimeError("❌ Could not connect to ChromaDB.") from e
 
-# Create state collections
+# Create state collections from config
 for state_name, collection_name in state_config.items():
     try:
-        state_collections[state_name] = chroma_client.get_or_create_collection(name=collection_name)
+        state_collections[state_name] = chroma_client.get_or_create_collection(
+            name=collection_name
+        )
         print(f"[COLLECTION] Ready: {collection_name}")
     except Exception as e:
         print(f"[COLLECTION ERROR] {e}", flush=True)
 
-# QA collection
+# Optional QA collection (unchanged)
 qa_collection_california = chroma_client.get_or_create_collection(name="qa_pairs")
 
 # =========================================================
 # Embedding model & splitter
 # =========================================================
+
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 text_splitter = RecursiveCharacterTextSplitter(
@@ -118,21 +141,27 @@ text_splitter = RecursiveCharacterTextSplitter(
 # =========================================================
 # Request Models
 # =========================================================
+
+
 class QuestionRequest(BaseModel):
     question: str
     state: str = "California"
+
 
 class SavePairRequest(BaseModel):
     question: str
     sql: str
 
+
 class VectorizeRequest(BaseModel):
     state: str
     file_paths: List[str]
 
+
 # =========================================================
-# Category labels
+# Category Labels (Used for Optional Chunk Classification)
 # =========================================================
+
 CATEGORY_LABELS = [
     "definition",
     "requirement",
@@ -141,148 +170,133 @@ CATEGORY_LABELS = [
     "benefit",
     "challenge",
     "feature",
-    "comparison"
+    "comparison",
 ]
 
 # =========================================================
-# Heuristic scoring functions
+# Heuristic Category Scorer
 # =========================================================
+
+
 def heuristic_category_scores(text: str) -> Dict[str, int]:
+    """
+    Very lightweight pattern-based classifier to tag chunks with coarse labels.
+    """
     t = text.lower()
     scores = {cat: 0 for cat in CATEGORY_LABELS}
 
-    # Definitions
-    definition_keywords = [
-        "is defined as", "refers to", "means", "defined as",
-        "in this section,", "for the purposes of"
+    definition_kw = ["is defined as", "refers to", "means", "defined as"]
+    statistic_kw = [
+        "percent",
+        "percentage",
+        "ratio",
+        "survey",
+        "data",
+        "average",
+        "median",
+        "mean",
     ]
+    requirement_kw = ["must", "shall", "required", "mandatory", "eligibility"]
+    procedure_kw = ["steps", "step", "process", "procedure", "how to"]
+    benefit_kw = ["benefit", "advantage", "improves", "helps", "reduces", "supports"]
+    challenge_kw = ["challenge", "difficulty", "problem", "issue", "barrier", "concern"]
+    feature_kw = ["feature", "includes", "consists of", "characteristic"]
+    comparison_kw = ["versus", "vs", "compared to", "difference", "in contrast"]
 
-    # Statistic
-    statistic_patterns = [r"\b\d{1,3}%\b"]
-    statistic_keywords = [
-        "percent", "percentage", "ratio", "figure", "table", "chart",
-        "survey", "data", "results", "average", "median", "mean", "distribution"
-    ]
-
-    # Requirement
-    requirement_keywords = [
-        "must", "shall", "required", "mandatory", "shall not",
-        "must not", "compliance", "regulation", "rule", "criteria", "eligibility"
-    ]
-
-    # Procedure
-    procedure_keywords = [
-        "steps", "step", "process", "procedure", "workflow",
-        "sequence", "how to", "instructions", "method", "stage", "phase"
-    ]
-
-    # Benefit
-    benefit_keywords = [
-        "benefit", "advantage", "improves", "increases", "reduces",
-        "helps", "enhances", "positive outcome", "gain"
-    ]
-
-    # Challenge
-    challenge_keywords = [
-        "challenge", "difficulty", "problem", "issue", "barrier",
-        "concern", "hard to", "struggle", "limitation"
-    ]
-
-    # Feature
-    feature_keywords = [
-        "feature", "characteristic", "attribute", "property",
-        "type", "category", "includes", "consists of"
-    ]
-
-    # Comparison
-    comparison_keywords = [
-        "compared to", "versus", "vs", "difference",
-        "similarity", "in contrast", "better than", "worse than"
-    ]
-
-    for kw in definition_keywords:
+    for kw in definition_kw:
         if kw in t:
             scores["definition"] += 2
 
-    for pattern in statistic_patterns:
-        if re.search(pattern, t):
-            scores["statistic"] += 3
-    for kw in statistic_keywords:
+    for kw in statistic_kw:
         if kw in t:
             scores["statistic"] += 1
 
-    for kw in requirement_keywords:
+    for kw in requirement_kw:
         if kw in t:
             scores["requirement"] += 1
 
-    for kw in procedure_keywords:
+    for kw in procedure_kw:
         if kw in t:
             scores["procedure"] += 1
 
-    for kw in benefit_keywords:
+    for kw in benefit_kw:
         if kw in t:
             scores["benefit"] += 1
 
-    for kw in challenge_keywords:
+    for kw in challenge_kw:
         if kw in t:
             scores["challenge"] += 1
 
-    for kw in feature_keywords:
+    for kw in feature_kw:
         if kw in t:
             scores["feature"] += 1
 
-    for kw in comparison_keywords:
+    for kw in comparison_kw:
         if kw in t:
             scores["comparison"] += 1
 
     return scores
 
+
 def normalize_scores(scores: Dict[str, int]) -> Dict[str, float]:
-    if not scores:
-        return {}
-    max_score = max(scores.values())
+    max_score = max(scores.values(), default=0)
     if max_score == 0:
         return {}
     return {k: round(v / max_score, 3) for k, v in scores.items() if v > 0}
 
+
 # =========================================================
-# LLM fallback (OpenAI)
+# LLM Fallback Classifier (Optional)
 # =========================================================
+
+
 def llm_category_fallback(text: str) -> Dict[str, float]:
+    """
+    If heuristic classification is too weak, optionally ask the LLM to tag the text.
+    Returns {category: 1.0, ...} style scores for recognized labels.
+    """
+    if not OPENAI_API_KEY:
+        return {}
+
     try:
         labels_str = ", ".join(CATEGORY_LABELS)
         prompt = (
             "Classify the following text into one or more categories.\n"
             f"Valid categories: {labels_str}.\n"
-            "Return a comma-separated list.\n\n"
-            f"Text:\n{text[:4000]}\n\n"
-            "Categories:"
+            "Return ONLY a comma-separated list of category names.\n\n"
+            f"Text:\n{text[:4000]}\n"
         )
 
         resp = oai.chat.completions.create(
             model=OPENAI_LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0
+            temperature=0,
         )
 
-        raw = resp.choices[0].message["content"].lower().strip()
-
+        raw = resp.choices[0].message.content.strip().lower()
         if not raw:
             return {}
 
         parts = [p.strip() for p in raw.split(",") if p.strip()]
-        result = {p: 1.0 for p in parts if p in CATEGORY_LABELS}
+        valid = {p for p in parts if p in CATEGORY_LABELS}
 
-        return result
+        return {p: 1.0 for p in valid}
 
     except Exception as e:
         print(f"[OPENAI FALLBACK ERROR] {e}", flush=True)
         return {}
 
+
 # =========================================================
-# Combined classifier
+# Combined Category Helper
 # =========================================================
+
+
 def get_chunk_categories(text: str) -> Dict[str, float]:
+    """
+    First use heuristic scores; if all zero, try LLM.
+    If still nothing, fall back to {"other": 1.0}.
+    """
     scores = heuristic_category_scores(text)
     normalized = normalize_scores(scores)
 
@@ -295,197 +309,263 @@ def get_chunk_categories(text: str) -> Dict[str, float]:
 
     return {"other": 1.0}
 
-# Endpoint for Login
-class LoginRequest(BaseModel):
-    username: str
-    password: str
 
-@app.post("/login")
-async def login(request: LoginRequest):
+# =========================================================
+# VECTORIZE — FILE-AGNOSTIC INGESTION PIPELINE
+# =========================================================
+
+@app.post("/vectorize")
+async def vectorize_documents(request: VectorizeRequest):
     """
-    Authenticate user with username and password.
-    Returns success status and user information.
+    Vectorizes uploaded documents for a given state.
+
+    - Uses dynamic state -> collection mapping from config.json.
+    - Supports common doc types:
+        * .pdf       -> PyPDFLoader
+        * .doc/.docx -> UnstructuredWordDocumentLoader
+        * .csv       -> CSVLoader
+        * everything else -> TextLoader (file-agnostic fallback)
+    - Splits into chunks and stores embeddings + metadata in Chroma.
+
+    Metadata schema is aligned with chat-feature backend:
+        {
+            "source": <filename>,
+            "state": <state name>,
+            "chunk_index": <int>,
+            "file_type": <extension>,
+            "categories": <JSON string of category scores>
+        }
     """
+
     try:
-        username = request.username
-        password = request.password
-        
-        print(f"[LOGIN] Login attempt for user: {username}")
-        
-        # TODO: Replace with actual authentication logic (database, OAuth, etc.)
-        # For now, using simple demo credentials
-        if username == "admin" and password == "admin123":
-            print(f"[LOGIN] Successful login for user: {username}")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": "Login successful",
-                    "user": {
-                        "username": username,
-                        "role": "admin"
-                    }
-                }
-            )
-        else:
-            print(f"[LOGIN] Failed login attempt for user: {username}")
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "success": False,
-                    "message": "Invalid username or password"
-                }
-            )
-    
-    except Exception as e:
-        print(f"[LOGIN ERROR] {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "message": f"Login failed: {str(e)}"
-            }
-        )
+        state = request.state
+        fpaths = request.file_paths
 
+        # Validate state
+        if state not in state_collections:
+            return {
+                "error": f"Invalid state '{state}'. "
+                         f"Available: {list(state_collections.keys())}"
+            }
+
+        collection = state_collections[state]
+
+        total_chunks = 0
+        processed_files: List[str] = []
+
+        for fp in fpaths:
+            p = Path(fp)
+
+            if not p.exists():
+                print(f"[VECTORIZE] File missing: {fp}")
+                continue
+
+            ext = p.suffix.lower()
+            print(f"[VECTORIZE] Loading file: {p.name} (ext={ext})")
+
+            # ----- Choose loader based on extension -----
+            try:
+                if ext == ".pdf":
+                    loader = PyPDFLoader(str(p))
+                elif ext in [".doc", ".docx"]:
+                    loader = UnstructuredWordDocumentLoader(str(p))
+                elif ext == ".csv":
+                    loader = CSVLoader(str(p))
+                else:
+                    # Generic text-based fallback for any other extension (.txt, .md, .rtf, .html, .json, etc.)
+                    loader = TextLoader(str(p), encoding="utf-8")
+
+                docs = loader.load()
+            except Exception as e:
+                print(f"[VECTORIZE] Failed to load {p.name} with loader: {e}")
+                continue
+
+            if not docs:
+                print(f"[VECTORIZE] No text extracted from {p.name}")
+                continue
+
+            # Split into chunks
+            chunks = text_splitter.split_documents(docs)
+            print(f"[VECTORIZE] {len(chunks)} chunks created from {p.name}")
+
+            for i, chunk in enumerate(chunks):
+                # LangChain Document has .page_content
+                text = getattr(chunk, "page_content", "").strip()
+                if not text:
+                    continue
+
+                # Category scoring (optional metadata)
+                categories = get_chunk_categories(text)
+                categories_json = json.dumps(categories)
+
+                # Embedding
+                embedding = model.encode(text).tolist()
+
+                # Unique chunk id (aligned with your existing pattern)
+                chunk_id = f"{p.stem}_chunk_{i}_{total_chunks}"
+
+                # Store into Chroma
+                collection.add(
+                    embeddings=[embedding],
+                    documents=[text],
+                    metadatas=[
+                        {
+                            "source": p.name,
+                            "state": state,
+                            "chunk_index": i,
+                            "file_type": ext,
+                            "categories": categories_json,
+                        }
+                    ],
+                    ids=[chunk_id],
+                )
+
+                total_chunks += 1
+
+            processed_files.append(p.name)
+
+        return {
+            "message": "Vectorization complete",
+            "processed_files": processed_files,
+            "total_chunks": total_chunks,
+            "collection_count": collection.count(),
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 # =========================================================
 # INSPECTION ENDPOINTS
 # =========================================================
+
 @app.get("/states")
 async def get_states():
+    """
+    Returns all states defined in config.json (dynamic).
+    """
     try:
         return {"states": list(state_config.keys()), "count": len(state_config)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 @app.get("/collections")
 async def get_collections():
+    """
+    Lists all Chroma collections and shows small sample of their content.
+    """
     try:
         cols = chroma_client.list_collections()
         result = []
+
         for col in cols:
             c = chroma_client.get_collection(col.name)
-            cnt = c.count()
+            count = c.count()
+
             peek = None
-            if cnt > 0:
+            if count > 0:
                 pdata = c.peek(limit=3)
                 peek = {
                     "documents": pdata.get("documents", []),
                     "metadatas": pdata.get("metadatas", []),
                     "ids": pdata.get("ids", []),
                 }
-            result.append({"name": col.name, "count": cnt, "sample": peek})
+
+            result.append(
+                {
+                    "name": col.name,
+                    "count": count,
+                    "sample": peek,
+                }
+            )
+
         return {"collections": result}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 # =========================================================
-# UPLOAD
+# UPLOAD ENDPOINT
 # =========================================================
+
 @app.post("/upload")
-async def upload_documents(files: List[UploadFile] = File(...), state: str = Form(...)):
+async def upload_documents(
+    files: List[UploadFile] = File(...), state: str = Form(...)
+):
+    """
+    Uploads files into /app/Data/<state> for later vectorization.
+    """
     try:
-        state_dir = state.lower().replace(" ", "_")
-        upload_dir = DATA_DIR / state_dir
+        state_folder = state.lower().replace(" ", "_")
+        upload_dir = DATA_DIR / state_folder
         upload_dir.mkdir(parents=True, exist_ok=True)
 
-        saved = []
+        saved_paths: List[str] = []
 
         for f in files:
             dest = upload_dir / f.filename
             with open(dest, "wb") as buffer:
                 shutil.copyfileobj(f.file, buffer)
-            saved.append(str(dest))
+            saved_paths.append(str(dest))
 
-        return {"message": "Uploaded", "file_paths": saved, "state": state}
+        return {
+            "message": "Uploaded successfully",
+            "file_paths": saved_paths,
+            "state": state,
+        }
 
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 # =========================================================
-# VECTORIZE (FINAL)
+# LOGIN ENDPOINT (DEMO)
 # =========================================================
-@app.post("/vectorize")
-async def vectorize_documents(request: VectorizeRequest):
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+async def login(request: LoginRequest):
+    """
+    Demo login endpoint — replace with real authentication later.
+    """
     try:
-        state = request.state
-        fpaths = request.file_paths
-
-        if state not in state_collections:
-            return {"error": f"Invalid state: {state}"}
-
-        collection = state_collections[state]
-
-        total_chunks = 0
-        done_files = []
-
-        for fp in fpaths:
-            p = Path(fp)
-            if not p.exists():
-                print(f"[VECTORIZE] File missing: {fp}")
-                continue
-
-            ext = p.suffix.lower()
-            if ext == ".pdf":
-                loader = PyPDFLoader(str(p))
-            elif ext in [".doc", ".docx"]:
-                loader = UnstructuredWordDocumentLoader(str(p))
-            elif ext == ".csv":
-                loader = CSVLoader(str(p))
-            elif ext == ".txt":
-                loader = TextLoader(str(p))
-            else:
-                print(f"[VECTORIZE] Unsupported: {ext}")
-                continue
-
-            docs = loader.load()
-            chunks = text_splitter.split_documents(docs)
-
-            for i, chunk in enumerate(chunks):
-                text = chunk.page_content
-
-                categories = get_chunk_categories(text)
-                categories_json = json.dumps(categories)  # FIX for Chroma
-
-                emb = model.encode(text).tolist()
-
-                doc_id = f"{p.stem}_chunk_{i}_{total_chunks}"
-
-                collection.add(
-                    embeddings=[emb],
-                    documents=[text],
-                    metadatas=[{
-                        "source": p.name,
-                        "state": state,
-                        "chunk_index": i,
-                        "file_type": ext,
-                        "categories": categories_json
-                    }],
-                    ids=[doc_id]
-                )
-
-                total_chunks += 1
-
-            done_files.append(p.name)
-
-        return {
-            "message": "Vectorization complete",
-            "processed_files": done_files,
-            "total_chunks": total_chunks,
-            "collection_count": collection.count()
-        }
+        if request.username == "admin" and request.password == "admin123":
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Login successful",
+                    "user": {"username": request.username, "role": "admin"},
+                },
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "message": "Invalid username or password"},
+        )
 
     except Exception as e:
         traceback.print_exc()
-        return {"error": str(e)}
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": f"Login failed: {str(e)}"},
+        )
+
 
 # =========================================================
-# Placeholder /ask
+# PLACEHOLDER /ask ENDPOINT
 # =========================================================
+
 @app.post("/ask")
 async def ask_question(request: QuestionRequest):
+    """
+    Placeholder API for simple QA (not used by new chat-feature backend).
+    """
     return {"message": "placeholder"}

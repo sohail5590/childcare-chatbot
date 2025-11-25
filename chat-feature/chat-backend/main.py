@@ -12,6 +12,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 from dotenv import load_dotenv
+import re  # for follow-up extraction helpers
 
 # =========================================================
 # Environment Setup
@@ -293,27 +294,21 @@ def llm_rerank(query: str, items: List[Dict[str, Any]], rerank_k: int) -> List[D
     return ordered[: min(rerank_k, len(ordered))]
 
 # =========================================================
-# Context Building
+# Context Building (answer-only, no "diverse" context)
 # =========================================================
 
 
-def build_answer_and_diverse_context(
+def build_answer_context(
     reranked: List[Dict[str, Any]],
-    retrieved: List[Dict[str, Any]],
     max_answer_docs: int = 5,
-    max_diverse_docs: int = 5,
     max_chars: int = 12000,
 ):
     """
     Build:
-      - answer_context: main docs for answering (only top reranked)
-      - diverse_context_only: extra docs used only for follow-up generation
+      - answer_context: main docs for answering (top reranked)
       - context_docs: unique docs used as 'sources'
     """
     top_main = reranked[:max_answer_docs]
-    main_ids = {d["id"] for d in top_main}
-
-    diverse_docs = [d for d in retrieved if d["id"] not in main_ids][:max_diverse_docs]
 
     seen_texts = set()
     answer_chunks = []
@@ -330,19 +325,7 @@ def build_answer_and_diverse_context(
     if len(answer_context) > max_chars:
         answer_context = answer_context[:max_chars]
 
-    diverse_chunks = []
-    seen_texts_div = set()
-    for d in diverse_docs:
-        if d["document"] not in seen_texts_div:
-            seen_texts_div.add(d["document"])
-            src = d.get("metadata", {}).get("source", "unknown")
-            diverse_chunks.append(f"[Source: {src}]\n{d['document']}")
-
-    diverse_context_only = "\n\n".join(diverse_chunks)
-    if len(diverse_context_only) > max_chars:
-        diverse_context_only = diverse_context_only[:max_chars]
-
-    return answer_context, diverse_context_only, context_docs
+    return answer_context, context_docs
 
 # =========================================================
 # History Utilities
@@ -370,32 +353,53 @@ Instructions:
 - Every factual statement should have a citation like [Source: filename].
 - If the context does not contain enough information, say so clearly.
 - Do NOT invent policies, laws, or numbers.
-- Keep the answer concise, around 400 characters, but complete enough to be useful.
 - Use short paragraphs or bullets when helpful.
+- When the document contains a general policy and a special-case policy, and the question refers to the special case, answer ONLY using the special-case rule.
 
-Return ONLY the answer text. Do not include JSON or any extra keys.
+TABLE RULE:
+- If the information in the context is clearly structured (such as repeated fields, numeric lists, ranges, income tables, thresholds, or row-like patterns), you MUST present it using a clean HTML <table>.
+- Do NOT use Markdown tables.
+- Do NOT wrap the HTML in code blocks.
+- Use <table>, <tr>, <th>, and <td> tags.
+- Always include headers if identifiable from context.
+- If the context contains only one row or cannot logically form a table, use normal text.
+
+FORMATTING:
+- Answers must be concise but complete.
+- Bullets or short paragraphs are allowed.
+- HTML tables must render cleanly.
+
+Return ONLY the answer text (which may contain HTML). Do not include JSON or any extra keys.
 """
 
 FOLLOWUP_SYSTEM_PROMPT = """
-You are helping generate a follow-up question after an answer has already been given.
+You generate a follow-up question ONLY if it can be fully answered using the SAME context excerpts.
 
-You are given:
-- The user's original question
-- The assistant's answer
-- Additional diverse context passages from the documents
-- A brief summary of recent conversation
+You must also use adjacency logic:
+- Look at the specific chunk(s) that contain the answer.
+- Identify the NEXT detail, requirement, step, rule, exception, or field
+  that appears in the same paragraph or bullet list, or in the immediately
+  adjacent chunks in the document (by chunk_index).
+- Formulate a follow-up question that asks about that next detail.
 
-Your task:
-- Propose exactly ONE natural, conversational follow-up question.
-- It must:
-  - Be relevant to both the user's question and the assistant's answer.
-  - Use the diverse context if it hints at important related topics not fully covered yet.
-  - Encourage deeper exploration of the same regulation, process, or related practical detail.
-  - Avoid trivial questions like "Do you want more help?" or repeating the same question.
+TONE REQUIREMENT:
+- The follow-up question MUST start with one of:
+  - "Do you want"
+  - "Do you need"
+  - "Would you like"
 
-Return ONLY valid JSON of the form:
+STRICT RULES:
+1. Only propose a follow-up if it is fully grounded in the provided context.
+2. The follow-up must refer to information that appears CLOSE to the part used
+   in the answer (same bullet group, same section, or next listed requirement).
+3. Do NOT ask anything the context does not contain.
+4. Do NOT generalize, guess, infer, or broaden.
+5. If no meaningful adjacent detail exists, return an empty string.
+
+FORMAT:
+Return ONLY JSON:
 {
-  "next_question": "<follow-up question here>"
+  "next_question": "<question or empty string>"
 }
 """
 
@@ -429,11 +433,65 @@ def generate_answer(model: str, question: str, context_text: str, history: List[
     return resp.choices[0].message.content.strip()
 
 
+def should_generate_followup(answer_text: str) -> bool:
+    """
+    Suppress follow-up questions when the answer indicates:
+    - insufficient information,
+    - missing context,
+    - uncertainty,
+    - inability to answer,
+    - or references to external sources.
+    This is domain-agnostic and works for ANY topic.
+    """
+    txt = answer_text.lower()
+
+    negative_patterns = [
+        # Signals missing/insufficient context
+        "context does not provide",
+        "context does not contain",
+        "context does not include",
+        "no information available",
+        "not enough information",
+        "insufficient information",
+        "cannot determine from the context",
+        "nothing in the context",
+        "not mentioned in the context",
+
+        # Signals uncertainty or inability to answer
+        "cannot answer",
+        "cannot provide an answer",
+        "unable to answer",
+        "i am not sure",
+        "uncertain",
+        "unknown",
+
+        # Signals redirection to external sources (domain-agnostic)
+        "refer to the relevant",
+        "refer to the appropriate",
+        "contact the appropriate",
+        "consult the appropriate",
+        "check with your",
+        "contact your",
+        "refer to official",
+        "refer to external documentation",
+        "outside the scope",
+        "requires external",
+        "requires additional sources",
+
+        # Strong indicator answer is incomplete or speculative
+        "i would be speculating",
+        "cannot confirm",
+        "cannot verify",
+    ]
+
+    return not any(p in txt for p in negative_patterns)
+
+
 def generate_followup(
     model: str,
     question: str,
     answer: str,
-    diverse_context: str,
+    context_text: str,
     history: List[ChatTurn],
 ) -> str:
     messages = [{"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT}]
@@ -446,9 +504,10 @@ def generate_followup(
     user_content = (
         f"Original user question:\n{question}\n\n"
         f"Assistant's answer:\n{answer}\n\n"
-        f"Additional diverse context from related documents:\n{diverse_context}\n\n"
+        f"Context excerpts used for the answer:\n{context_text}\n\n"
         f"Recent conversation summary:\n{summary}\n\n"
-        "Now produce exactly one useful follow-up question in JSON as specified."
+        "Now decide whether there is a grounded next question. "
+        "If yes, return it in JSON as specified. If not, return an empty string in JSON."
     )
 
     messages.append({"role": "user", "content": user_content})
@@ -461,13 +520,191 @@ def generate_followup(
         )
         raw = resp.choices[0].message.content.strip()
         parsed = json.loads(raw)
-        next_q = parsed.get("next_question", "").strip()
-        if not next_q:
-            raise ValueError("Empty next_question")
+        next_q = parsed.get("next_question", "")
+        if not isinstance(next_q, str):
+            raise ValueError("next_question is not a string")
+        next_q = next_q.strip()
         return next_q
     except Exception as e:
-        print(f"[FOLLOWUP] Failed to parse JSON follow-up, using fallback: {e}")
-        return "Would you like to explore eligibility details, application steps, or timelines related to this topic?"
+        print(f"[FOLLOWUP] Failed to parse JSON follow-up, using empty follow-up: {e}")
+        return ""
+
+# =========================================================
+# Follow-up Extraction Helpers (Adjacent-Context Logic)
+# =========================================================
+
+
+def extract_key_points(text: str) -> List[str]:
+    """
+    Extract bullet points, numbered items, or substantial lines from a chunk.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    bullets: List[str] = []
+    for l in lines:
+        # bullet or dash or en dash + space
+        if re.match(r"^[•\-–]\s+", l):
+            bullets.append(l)
+        # numbered list like "1. " or "2) "
+        elif re.match(r"^\d+[.)]\s+", l):
+            bullets.append(l)
+        else:
+            # fallback: longer lines treated as key points
+            if len(l.split()) > 6:
+                bullets.append(l)
+    return bullets
+
+
+def match_answered_items(answer: str, items: List[str]) -> List[str]:
+    """
+    Determine which extracted items were actually used in the answer.
+    Uses simple token overlap to remain deterministic & safe.
+    """
+    used: List[str] = []
+    ans = answer.lower()
+    for item in items:
+        words = item.lower().split()
+        overlap = sum(1 for w in words if w in ans)
+        if overlap >= max(3, int(len(words) * 0.3)):
+            used.append(item)
+    return used
+
+
+def select_adjacent_items(items: List[str], used_items: List[str]) -> List[str]:
+    """
+    Select neighbors of used items within the SAME chunk (by bullet order).
+    This is intra-chunk adjacency, independent of chunk_index.
+    """
+    if not used_items:
+        return []
+
+    neighbors: List[str] = []
+
+    used_set = set(used_items)
+    used_indexes = [idx for idx, val in enumerate(items) if val in used_set]
+
+    for idx in used_indexes:
+        for n in (idx - 1, idx + 1):
+            if 0 <= n < len(items):
+                if items[n] not in used_items:
+                    neighbors.append(items[n])
+
+    # de-duplicate while preserving order
+    return list(dict.fromkeys(neighbors))
+
+
+def select_adjacent_chunks(
+    reranked: List[Dict[str, Any]],
+    used_chunks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Select document-adjacent chunks based on metadata['chunk_index'].
+    For each used chunk, we look at chunk_index - 1 and + 1
+    among the reranked results.
+    """
+    if not used_chunks:
+        return []
+
+    used_indexes: List[int] = []
+    for c in used_chunks:
+        meta = c.get("metadata", {})
+        if "chunk_index" in meta and isinstance(meta["chunk_index"], int):
+            used_indexes.append(meta["chunk_index"])
+
+    if not used_indexes:
+        return []
+
+    # Build lookup: chunk_index -> chunk
+    index_lookup: Dict[int, Dict[str, Any]] = {}
+    for c in reranked:
+        meta = c.get("metadata", {})
+        idx = meta.get("chunk_index")
+        if isinstance(idx, int):
+            index_lookup[idx] = c
+
+    neighbors: List[Dict[str, Any]] = []
+    for idx in used_indexes:
+        for neighbor_idx in (idx - 1, idx + 1):
+            if neighbor_idx in index_lookup:
+                neighbors.append(index_lookup[neighbor_idx])
+
+    # Deduplicate by id while preserving order
+    seen_ids = set()
+    result: List[Dict[str, Any]] = []
+    for c in neighbors:
+        cid = c.get("id")
+        if cid and cid not in seen_ids:
+            result.append(c)
+            seen_ids.add(cid)
+
+    return result
+
+# =========================================================
+# Sources UI Helper
+# =========================================================
+
+
+def build_sources_ui(context_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build a UI-friendly sources structure:
+
+    [
+      {
+        "source": "<filename>",
+        "chunks": [
+          {
+            "id": "<chunk id>",
+            "chunk_index": <int or None>,
+            "snippet": "<first line / first few words>"
+          },
+          ...
+        ]
+      },
+      ...
+    ]
+
+    This lets the frontend group by file and show collapsible chunks/snippets
+    instead of listing the same filename repeatedly.
+    """
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for d in context_docs:
+        meta = d.get("metadata", {}) or {}
+        filename = meta.get("source", "unknown")
+        chunk_index = meta.get("chunk_index")
+        chunk_id = d.get("id")
+
+        text = d.get("document", "") or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            snippet = lines[0]
+        else:
+            snippet = text[:160]
+
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+
+        if filename not in grouped:
+            grouped[filename] = {
+                "source": filename,
+                "chunks": [],
+            }
+
+        # Avoid duplicate chunk ids
+        existing_ids = {c.get("id") for c in grouped[filename]["chunks"]}
+        if chunk_id not in existing_ids:
+            grouped[filename]["chunks"].append(
+                {
+                    "id": chunk_id,
+                    "chunk_index": chunk_index,
+                    "snippet": snippet,
+                }
+            )
+
+    # Optionally sort chunks by chunk_index when available
+    for g in grouped.values():
+        g["chunks"].sort(key=lambda c: (c["chunk_index"] is None, c["chunk_index"]))
+
+    return list(grouped.values())
 
 # =========================================================
 # Routes
@@ -488,12 +725,12 @@ def chat(req: ChatRequest):
 
     reranked = llm_rerank(req.question, retrieved, rerank_k=req.rerank_k)
 
-    answer_context, diverse_context, context_docs = build_answer_and_diverse_context(
-        reranked, retrieved
-    )
+    # Build answer context from reranked docs
+    answer_context, context_docs = build_answer_context(reranked)
 
     trimmed_history = trim_history(req.history or [])
 
+    # 1) Generate grounded answer
     answer_text = generate_answer(
         model=OPENAI_MODEL,
         question=req.question,
@@ -501,13 +738,91 @@ def chat(req: ChatRequest):
         history=trimmed_history,
     )
 
-    next_question = generate_followup(
-        model=OPENAI_MODEL,
-        question=req.question,
-        answer=answer_text,
-        diverse_context=diverse_context,
-        history=trimmed_history,
-    )
+    # 2) Optionally generate grounded follow-up (chunk_index + intra-chunk adjacency)
+    followup_candidates: List[str] = []
+
+    # Keep info per chunk to support fallback later
+    per_chunk_info: List[Dict[str, Any]] = []
+    used_chunks: List[Dict[str, Any]] = []
+
+    # First: same-chunk adjacency based on bullet-level usage
+    for d in context_docs:
+        chunk_text = d["document"]
+        items = extract_key_points(chunk_text)
+        used_items = match_answered_items(answer_text, items)
+
+        per_chunk_info.append(
+            {
+                "chunk": d,
+                "items": items,
+                "used_items": used_items,
+            }
+        )
+
+        neighbors_same = select_adjacent_items(items, used_items)
+        followup_candidates.extend(neighbors_same)
+
+        if used_items:
+            used_chunks.append(d)
+
+    # Second: adjacent chunks based on chunk_index
+    adjacent_chunks = select_adjacent_chunks(reranked, used_chunks)
+    for ch in adjacent_chunks:
+        items = extract_key_points(ch["document"])
+        per_chunk_info.append(
+            {
+                "chunk": ch,
+                "items": items,
+                "used_items": [],
+            }
+        )
+        followup_candidates.extend(items)
+
+    # Deduplicate early (preserve order)
+    followup_candidates = list(dict.fromkeys(followup_candidates))
+
+    # =====================================================
+    # Fallback follow-up logic:
+    # If neighbors are empty, fall back to unused items from
+    # chunks that contributed to the answer, then any items.
+    # =====================================================
+    if should_generate_followup(answer_text):
+        if not followup_candidates:
+            # 1) Try unused items from chunks where some items were used
+            fallback_items: List[str] = []
+            for info in per_chunk_info:
+                items = info["items"]
+                used_items = set(info["used_items"] or [])
+                if items and used_items and len(used_items) < len(items):
+                    unused = [i for i in items if i not in used_items]
+                    fallback_items.extend(unused)
+
+            # 2) If still empty, consider any items from context chunks
+            if not fallback_items:
+                for info in per_chunk_info:
+                    items = info["items"]
+                    if items:
+                        fallback_items.extend(items)
+
+            # Deduplicate
+            fallback_items = list(dict.fromkeys(fallback_items))
+            followup_candidates = fallback_items
+
+    # Build the follow-up context text from candidates
+    followup_context_text = ""
+    next_question = ""
+
+    if should_generate_followup(answer_text) and followup_candidates:
+        followup_context_text = "\n".join(followup_candidates[:6])
+        print("\n[FOLLOWUP CONTEXT]\n", followup_context_text)
+
+        next_question = generate_followup(
+            model=OPENAI_MODEL,
+            question=req.question,
+            answer=answer_text,
+            context_text=followup_context_text,
+            history=trimmed_history,
+        )
 
     elapsed_ms = round((time.time() - start) * 1000)
     print(
@@ -521,8 +836,13 @@ def chat(req: ChatRequest):
         dist = r.get("distance", 0)
         print(f"[DEBUG] Top{i+1} src={src} dist={dist}")
 
+    # Build UI-friendly sources
+    structured_sources = build_sources_ui(context_docs)
+
+    
+
     return ChatResponse(
         answer=answer_text,
         next_question=next_question,
-        sources=context_docs,
+        sources=structured_sources,
     )
