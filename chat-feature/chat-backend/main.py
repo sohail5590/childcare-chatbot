@@ -356,6 +356,21 @@ Instructions:
 - Use short paragraphs or bullets when helpful.
 - When the document contains a general policy and a special-case policy, and the question refers to the special case, answer ONLY using the special-case rule.
 
+STRICT GROUNDEDNESS RULES:
+- You MUST answer ONLY using the provided context excerpts.
+- You MUST cite every factual statement using the exact filename(s) found in the context.
+- If a question REQUIRES information from more than one document, you MUST combine the relevant excerpts and produce a unified answer.
+- If a required document is NOT present in the context chunks, you MUST respond:
+  “The provided context does not include enough information to answer this completely.”
+
+NO HALLUCINATION RULES:
+- Do NOT add information not explicitly stated in the retrieved context.
+- Do NOT infer requirements, policies, or procedures not directly included in the context.
+- If the context is missing something, state that it is missing.
+
+SPECIAL-CASE PRIORITY RULE:
+- When the documents contain both a general rule and a special-case rule, and the question refers to the special case, answer ONLY using the special-case rule.
+
 TABLE RULE:
 - If the information in the context is clearly structured (such as repeated fields, numeric lists, ranges, income tables, thresholds, or row-like patterns), you MUST present it using a clean HTML <table>.
 - Do NOT use Markdown tables.
@@ -364,8 +379,15 @@ TABLE RULE:
 - Always include headers if identifiable from context.
 - If the context contains only one row or cannot logically form a table, use normal text.
 
+CITATION RULE:
+- Every sentence containing factual information must include a citation in this form:
+  [Source: filename]
+
+MULTI-DOCUMENT REQUIREMENT:
+- If the question mentions two concepts which are known to belong to different documents, the answer MUST cite BOTH documents OR state clearly that one is missing.
+
 FORMATTING:
-- Answers must be concise but complete.
+- Answers must be concise, factual and complete.
 - Bullets or short paragraphs are allowed.
 - HTML tables must render cleanly.
 

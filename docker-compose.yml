@@ -2,7 +2,41 @@ version: "3.9"
 
 services:
   # ========================================
-  # 1️⃣ ChromaDB (Vector Store)
+  # 1️⃣ PostgreSQL Database
+  # ========================================
+  postgres:
+    image: postgres:15
+    container_name: rag_ccb_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: childcare
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # ========================================
+  # 2️⃣ Database API (auto-seeded)
+  # ========================================
+  db-api:
+    build:
+      context: ./frontend/db
+    container_name: rag_ccb_db_api
+    ports:
+      - "9200:9200"
+    environment:
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/childcare
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    # ❗ NOTE: NO volumes override here
+    # ❗ NOTE: NO command override—start.sh will run automatically
+
+  # ========================================
+  # 3️⃣ ChromaDB (Vector Store)
   # ========================================
   chromadb:
     image: ghcr.io/chroma-core/chroma:latest
@@ -24,7 +58,7 @@ services:
     restart: unless-stopped
 
   # ========================================
-  # 2️⃣ Ingestion Backend (Uploads + Vectorization)
+  # 4️⃣ Ingestion Backend (Uploads + Vectorization)
   # ========================================
   backend:
     build:
@@ -34,7 +68,7 @@ services:
       - "9000:9000"
     working_dir: /app/backend
     volumes:
-      - ./backend:/app/backend              # mount backend code ONLY
+      - ./backend:/app/backend
       - ./Data:/app/Data
       - ./config.json:/app/config.json
       - chromadb_data:/chroma/chroma
@@ -51,7 +85,7 @@ services:
     restart: unless-stopped
 
   # ========================================
-  # 3️⃣ Admin Frontend (for uploading documents)
+  # 5️⃣ Admin Frontend (Streamlit)
   # ========================================
   frontend:
     build:
@@ -65,10 +99,15 @@ services:
     depends_on:
       backend:
         condition: service_started
+      db-api:
+        condition: service_started
+    environment:
+      DB_API_URL: http://db-api:9200
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/childcare
     restart: unless-stopped
 
   # ========================================
-  # 4️⃣ Chat Backend (FastAPI + Re-ranker)
+  # 6️⃣ Chat Backend (FastAPI)
   # ========================================
   chat-backend:
     build:
@@ -95,7 +134,7 @@ services:
     restart: unless-stopped
 
   # ========================================
-  # 5️⃣ Chat Frontend (Streamlit UI)
+  # 7️⃣ Chat Frontend (Streamlit)
   # ========================================
   chat-frontend:
     build:
@@ -119,3 +158,4 @@ services:
 
 volumes:
   chromadb_data:
+  postgres_data:
