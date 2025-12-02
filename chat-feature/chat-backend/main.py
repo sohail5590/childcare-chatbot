@@ -14,6 +14,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import re  # for follow-up extraction helpers
 
+
 # =========================================================
 # Environment Setup
 # =========================================================
@@ -39,6 +40,7 @@ os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
 
 print(f"CHROMA_HOST={CHROMA_HOST}:{CHROMA_PORT}")
 
+
 # =========================================================
 # App + Middleware
 # =========================================================
@@ -52,6 +54,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================================================
 # Dynamic State → Collection Mapping (config.json)
@@ -85,6 +88,7 @@ def load_state_collection_mapping() -> Dict[str, str]:
 
 STATE_TO_COLLECTION = load_state_collection_mapping()
 
+
 # =========================================================
 # Initialize Clients (Chroma + Embeddings + OpenAI LLM)
 # =========================================================
@@ -92,15 +96,15 @@ STATE_TO_COLLECTION = load_state_collection_mapping()
 
 def connect_chroma(retries: int = 12, delay: float = 2.0):
     last_err = None
-    for _ in range(retries):
+    for attempt in range(1, retries + 1):
         try:
             client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
             client.heartbeat()
-            print("Connected to ChromaDB")
+            print(f"Connected to ChromaDB on attempt {attempt}")
             return client
         except Exception as e:
             last_err = e
-            print(f"Waiting for ChromaDB... {e}")
+            print(f"Waiting for ChromaDB (attempt {attempt}/{retries})... {e}")
             time.sleep(delay)
     raise RuntimeError(f"Could not connect to ChromaDB: {last_err}")
 
@@ -108,6 +112,7 @@ def connect_chroma(retries: int = 12, delay: float = 2.0):
 chroma_client = connect_chroma()
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 oai = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # =========================================================
 # Pydantic Models
@@ -123,14 +128,16 @@ class ChatRequest(BaseModel):
     question: str
     state: str
     history: Optional[List[ChatTurn]] = []
-    top_k: Optional[int] = 15
-    rerank_k: Optional[int] = 8
+    # Defaults chosen so you naturally get 5 (answer) + 15 (follow-up pool)
+    top_k: Optional[int] = 40       # vector DB n_results
+    rerank_k: Optional[int] = 20    # how many to send into LLM reranker
 
 
 class ChatResponse(BaseModel):
     answer: str
     next_question: str
     sources: List[Dict[str, Any]]
+
 
 # =========================================================
 # Retrieval Helpers
@@ -144,13 +151,16 @@ def normalize_state(s: str) -> str:
 def pick_collection(state: str):
     key = normalize_state(state)
     if key not in STATE_TO_COLLECTION:
-        raise ValueError(f"Unsupported state '{state}'. Available: {list(STATE_TO_COLLECTION.keys())}")
+        raise ValueError(
+            f"Unsupported state '{state}'. Available: {list(STATE_TO_COLLECTION.keys())}"
+        )
     name = STATE_TO_COLLECTION[key]
     return chroma_client.get_or_create_collection(name=name)
 
 
 def retrieve(query: str, collection, top_k: int):
     """Initial vector retrieval from Chroma."""
+    print(f"[RETRIEVE] query='{query}' top_k={top_k}")
     q_vec = embedder.encode(query).tolist()
     res = collection.query(query_embeddings=[q_vec], n_results=top_k)
 
@@ -161,15 +171,20 @@ def retrieve(query: str, collection, top_k: int):
 
     items = []
     for i in range(len(docs)):
+        meta = metas[i] if i < len(metas) else {}
+        src = (meta or {}).get("source", "unknown")
+        print(f"[RETRIEVE] #{i+1} id={ids[i]} source={src} dist={dists[i]}")
         items.append(
             {
                 "id": ids[i],
                 "document": docs[i],
-                "metadata": metas[i] if i < len(metas) else {},
+                "metadata": meta,
                 "distance": dists[i] if dists and i < len(dists) else None,
             }
         )
+    print(f"[RETRIEVE] total_items={len(items)}")
     return items
+
 
 # =========================================================
 # LLM-based Reranker
@@ -234,11 +249,12 @@ Return ONLY valid JSON of the form:
 def llm_rerank(query: str, items: List[Dict[str, Any]], rerank_k: int) -> List[Dict[str, Any]]:
     """Use OpenAI LLM to rerank retrieved chunks."""
     if not items:
+        print("[RERANK] no items to rerank")
         return []
 
-    # Limit how many chunks we send to the model
-    MAX_CANDIDATES = min(len(items), 15)
+    MAX_CANDIDATES = min(len(items), rerank_k)
     candidates = items[:MAX_CANDIDATES]
+    print(f"[RERANK] got {len(items)} items, using {MAX_CANDIDATES} as candidates")
 
     # Build the chunk list text
     chunk_lines = []
@@ -270,13 +286,13 @@ def llm_rerank(query: str, items: List[Dict[str, Any]], rerank_k: int) -> List[D
             temperature=0.0,
         )
         raw = resp.choices[0].message.content.strip()
+        print(f"[RERANK] raw LLM output: {raw[:400]}...")
         parsed = json.loads(raw)
         ranked_ids = parsed.get("ranked_ids", [])
         if not isinstance(ranked_ids, list):
             raise ValueError("ranked_ids is not a list")
     except Exception as e:
         print(f"[RERANK] LLM rerank failed, falling back to original order: {e}")
-        # Just return original top rerank_k
         return items[: min(rerank_k, len(items))]
 
     # Map ids → item
@@ -286,35 +302,40 @@ def llm_rerank(query: str, items: List[Dict[str, Any]], rerank_k: int) -> List[D
     for cid in ranked_ids:
         if cid in item_by_id:
             ordered.append(item_by_id[cid])
+        else:
+            print(f"[RERANK] WARNING: ranked_id {cid} not in candidates")
 
     if not ordered:
-        # Fallback if all ids invalid
+        print("[RERANK] no valid ids in ranked_ids, falling back to candidates")
         ordered = candidates
+
+    print(f"[RERANK] final ordered count={len(ordered)}")
+    for i, it in enumerate(ordered[:5]):
+        src = (it.get("metadata") or {}).get("source", "unknown")
+        print(f"[RERANK] Top{i+1} id={it['id']} source={src} dist={it.get('distance')}")
 
     return ordered[: min(rerank_k, len(ordered))]
 
+
 # =========================================================
-# Context Building (answer-only, no "diverse" context)
+# Context Building (answer-only)
 # =========================================================
 
 
 def build_answer_context(
-    reranked: List[Dict[str, Any]],
-    max_answer_docs: int = 5,
+    docs: List[Dict[str, Any]],
     max_chars: int = 12000,
 ):
     """
     Build:
-      - answer_context: main docs for answering (top reranked)
+      - answer_context: main docs for answering
       - context_docs: unique docs used as 'sources'
     """
-    top_main = reranked[:max_answer_docs]
-
     seen_texts = set()
     answer_chunks = []
     context_docs: List[Dict[str, Any]] = []
 
-    for d in top_main:
+    for d in docs:
         if d["document"] not in seen_texts:
             seen_texts.add(d["document"])
             context_docs.append(d)
@@ -325,7 +346,10 @@ def build_answer_context(
     if len(answer_context) > max_chars:
         answer_context = answer_context[:max_chars]
 
+    print(f"[CONTEXT] built answer_context chars={len(answer_context)} "
+          f"unique_docs={len(context_docs)}")
     return answer_context, context_docs
+
 
 # =========================================================
 # History Utilities
@@ -340,6 +364,7 @@ def summarize_history(history: List[ChatTurn]) -> str:
     if not history:
         return ""
     return " ".join(h.content.strip() for h in history[-5:] if h.content)
+
 
 # =========================================================
 # System Prompts for Answer + Follow-up
@@ -356,6 +381,21 @@ Instructions:
 - Use short paragraphs or bullets when helpful.
 - When the document contains a general policy and a special-case policy, and the question refers to the special case, answer ONLY using the special-case rule.
 
+STRICT GROUNDEDNESS RULES:
+- You MUST answer ONLY using the provided context excerpts.
+- You MUST cite every factual statement using the exact filename(s) found in the context.
+- If a question REQUIRES information from more than one document, you MUST combine the relevant excerpts and produce a unified answer.
+- If a required document is NOT present in the context chunks, you MUST respond:
+  “The provided context does not include enough information to answer this completely.”
+
+NO HALLUCINATION RULES:
+- Do NOT add information not explicitly stated in the retrieved context.
+- Do NOT infer requirements, policies, or procedures not directly included in the context.
+- If the context is missing something, state that it is missing.
+
+SPECIAL-CASE PRIORITY RULE:
+- When the documents contain both a general rule and a special-case rule, and the question refers to the special case, answer ONLY using the special-case rule.
+
 TABLE RULE:
 - If the information in the context is clearly structured (such as repeated fields, numeric lists, ranges, income tables, thresholds, or row-like patterns), you MUST present it using a clean HTML <table>.
 - Do NOT use Markdown tables.
@@ -364,8 +404,15 @@ TABLE RULE:
 - Always include headers if identifiable from context.
 - If the context contains only one row or cannot logically form a table, use normal text.
 
+CITATION RULE:
+- Every sentence containing factual information must include a citation in this form:
+  [Source: filename]
+
+MULTI-DOCUMENT REQUIREMENT:
+- If the question mentions two concepts which are known to belong to different documents, the answer MUST cite BOTH documents OR state clearly that one is missing.
+
 FORMATTING:
-- Answers must be concise but complete.
+- Answers must be concise, factual and complete.
 - Bullets or short paragraphs are allowed.
 - HTML tables must render cleanly.
 
@@ -373,35 +420,38 @@ Return ONLY the answer text (which may contain HTML). Do not include JSON or any
 """
 
 FOLLOWUP_SYSTEM_PROMPT = """
-You generate a follow-up question ONLY if it can be fully answered using the SAME context excerpts.
+You generate a follow-up question ONLY if it can be fully answered using the SAME retrieved context.
 
-You must also use adjacency logic:
-- Look at the specific chunk(s) that contain the answer.
-- Identify the NEXT detail, requirement, step, rule, exception, or field
-  that appears in the same paragraph or bullet list, or in the immediately
-  adjacent chunks in the document (by chunk_index).
-- Formulate a follow-up question that asks about that next detail.
+You will be given:
+- The original user question
+- The assistant's answer
+- A small set of candidate snippets taken from OTHER relevant chunks
+  that the user has NOT yet seen.
+
+Your job is to create a SEMANTIC BRIDGE:
+- The follow-up must introduce NEW information from the candidate snippets.
+- It must be clearly related to the topic of the assistant's answer.
+- It should feel like a natural "next step" question a helpful case worker would ask.
+
+STRICT RESTRICTIONS:
+1. DO NOT ask about anything already covered in the assistant's answer.
+2. DO NOT ask about unrelated content even if it appears in the snippets.
+3. DO NOT infer or invent; only use what appears in the snippets.
+4. If no meaningful, grounded follow-up exists, return an empty string.
 
 TONE REQUIREMENT:
-- The follow-up question MUST start with one of:
+- The follow-up question MUST begin with one of:
   - "Do you want"
   - "Do you need"
   - "Would you like"
 
-STRICT RULES:
-1. Only propose a follow-up if it is fully grounded in the provided context.
-2. The follow-up must refer to information that appears CLOSE to the part used
-   in the answer (same bullet group, same section, or next listed requirement).
-3. Do NOT ask anything the context does not contain.
-4. Do NOT generalize, guess, infer, or broaden.
-5. If no meaningful adjacent detail exists, return an empty string.
-
 FORMAT:
-Return ONLY JSON:
+Return ONLY valid JSON in this exact shape:
 {
   "next_question": "<question or empty string>"
 }
 """
+
 
 # =========================================================
 # LLM Calls (Answer + Follow-up)
@@ -430,7 +480,9 @@ def generate_answer(model: str, question: str, context_text: str, history: List[
         messages=messages,
         temperature=0.2,
     )
-    return resp.choices[0].message.content.strip()
+    answer = resp.choices[0].message.content.strip()
+    print(f"[ANSWER] answer_text (first 400 chars): {answer[:400]}")
+    return answer
 
 
 def should_generate_followup(answer_text: str) -> bool:
@@ -484,14 +536,18 @@ def should_generate_followup(answer_text: str) -> bool:
         "cannot verify",
     ]
 
-    return not any(p in txt for p in negative_patterns)
+    suppressed = any(p in txt for p in negative_patterns)
+    print(f"[FOLLOWUP] should_generate_followup={not suppressed}")
+    if suppressed:
+        print("[FOLLOWUP] suppressed due to negative pattern match")
+    return not suppressed
 
 
 def generate_followup(
     model: str,
     question: str,
     answer: str,
-    context_text: str,
+    candidate_snippets: str,
     history: List[ChatTurn],
 ) -> str:
     messages = [{"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT}]
@@ -504,7 +560,7 @@ def generate_followup(
     user_content = (
         f"Original user question:\n{question}\n\n"
         f"Assistant's answer:\n{answer}\n\n"
-        f"Context excerpts used for the answer:\n{context_text}\n\n"
+        f"Candidate follow-up snippets (from other chunks):\n{candidate_snippets}\n\n"
         f"Recent conversation summary:\n{summary}\n\n"
         "Now decide whether there is a grounded next question. "
         "If yes, return it in JSON as specified. If not, return an empty string in JSON."
@@ -519,18 +575,21 @@ def generate_followup(
             temperature=0.3,
         )
         raw = resp.choices[0].message.content.strip()
+        print(f"[FOLLOWUP] raw LLM output: {raw[:400]}")
         parsed = json.loads(raw)
         next_q = parsed.get("next_question", "")
         if not isinstance(next_q, str):
             raise ValueError("next_question is not a string")
         next_q = next_q.strip()
+        print(f"[FOLLOWUP] next_question='{next_q}'")
         return next_q
     except Exception as e:
         print(f"[FOLLOWUP] Failed to parse JSON follow-up, using empty follow-up: {e}")
         return ""
 
+
 # =========================================================
-# Follow-up Extraction Helpers (Adjacent-Context Logic)
+# Follow-up Extraction Helpers (Pool-Based Logic)
 # =========================================================
 
 
@@ -553,90 +612,6 @@ def extract_key_points(text: str) -> List[str]:
                 bullets.append(l)
     return bullets
 
-
-def match_answered_items(answer: str, items: List[str]) -> List[str]:
-    """
-    Determine which extracted items were actually used in the answer.
-    Uses simple token overlap to remain deterministic & safe.
-    """
-    used: List[str] = []
-    ans = answer.lower()
-    for item in items:
-        words = item.lower().split()
-        overlap = sum(1 for w in words if w in ans)
-        if overlap >= max(3, int(len(words) * 0.3)):
-            used.append(item)
-    return used
-
-
-def select_adjacent_items(items: List[str], used_items: List[str]) -> List[str]:
-    """
-    Select neighbors of used items within the SAME chunk (by bullet order).
-    This is intra-chunk adjacency, independent of chunk_index.
-    """
-    if not used_items:
-        return []
-
-    neighbors: List[str] = []
-
-    used_set = set(used_items)
-    used_indexes = [idx for idx, val in enumerate(items) if val in used_set]
-
-    for idx in used_indexes:
-        for n in (idx - 1, idx + 1):
-            if 0 <= n < len(items):
-                if items[n] not in used_items:
-                    neighbors.append(items[n])
-
-    # de-duplicate while preserving order
-    return list(dict.fromkeys(neighbors))
-
-
-def select_adjacent_chunks(
-    reranked: List[Dict[str, Any]],
-    used_chunks: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    Select document-adjacent chunks based on metadata['chunk_index'].
-    For each used chunk, we look at chunk_index - 1 and + 1
-    among the reranked results.
-    """
-    if not used_chunks:
-        return []
-
-    used_indexes: List[int] = []
-    for c in used_chunks:
-        meta = c.get("metadata", {})
-        if "chunk_index" in meta and isinstance(meta["chunk_index"], int):
-            used_indexes.append(meta["chunk_index"])
-
-    if not used_indexes:
-        return []
-
-    # Build lookup: chunk_index -> chunk
-    index_lookup: Dict[int, Dict[str, Any]] = {}
-    for c in reranked:
-        meta = c.get("metadata", {})
-        idx = meta.get("chunk_index")
-        if isinstance(idx, int):
-            index_lookup[idx] = c
-
-    neighbors: List[Dict[str, Any]] = []
-    for idx in used_indexes:
-        for neighbor_idx in (idx - 1, idx + 1):
-            if neighbor_idx in index_lookup:
-                neighbors.append(index_lookup[neighbor_idx])
-
-    # Deduplicate by id while preserving order
-    seen_ids = set()
-    result: List[Dict[str, Any]] = []
-    for c in neighbors:
-        cid = c.get("id")
-        if cid and cid not in seen_ids:
-            result.append(c)
-            seen_ids.add(cid)
-
-    return result
 
 # =========================================================
 # Sources UI Helper
@@ -661,9 +636,6 @@ def build_sources_ui(context_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
       },
       ...
     ]
-
-    This lets the frontend group by file and show collapsible chunks/snippets
-    instead of listing the same filename repeatedly.
     """
     grouped: Dict[str, Dict[str, Any]] = {}
 
@@ -706,6 +678,7 @@ def build_sources_ui(context_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     return list(grouped.values())
 
+
 # =========================================================
 # Routes
 # =========================================================
@@ -720,13 +693,36 @@ def health():
 def chat(req: ChatRequest):
     start = time.time()
 
+    print("\n==================== /chat REQUEST ====================")
+    print(f"[REQ] question='{req.question}'")
+    print(f"[REQ] state='{req.state}' top_k={req.top_k} rerank_k={req.rerank_k}")
+
     collection = pick_collection(req.state)
     retrieved = retrieve(req.question, collection, top_k=req.top_k)
 
+    # Rerank up to rerank_k
     reranked = llm_rerank(req.question, retrieved, rerank_k=req.rerank_k)
+    print(f"[PIPELINE] after rerank: count={len(reranked)}")
 
-    # Build answer context from reranked docs
-    answer_context, context_docs = build_answer_context(reranked)
+    # =========================================================
+    # SPLIT RERANKED INTO: top_5 (answer) + remaining (follow-up pool)
+    # =========================================================
+    ANSWER_TOP_N = 5   # always use top 5 for answer
+    answer_docs = reranked[:ANSWER_TOP_N]
+    followup_pool_docs = retrieved[ANSWER_TOP_N : ANSWER_TOP_N + 15]
+
+    print(f"[SPLIT] answer_docs={len(answer_docs)} followup_pool_docs={len(followup_pool_docs)}")
+
+    for i, d in enumerate(answer_docs):
+        src = (d.get("metadata") or {}).get("source", "unknown")
+        print(f"[SPLIT] ANSWER_DOC #{i+1} id={d['id']} source={src}")
+
+    for i, d in enumerate(followup_pool_docs):
+        src = (d.get("metadata") or {}).get("source", "unknown")
+        print(f"[SPLIT] FOLLOWUP_POOL_DOC #{i+1} id={d['id']} source={src}")
+
+    # Build answer context only from top 5
+    answer_context, context_docs = build_answer_context(answer_docs)
 
     trimmed_history = trim_history(req.history or [])
 
@@ -738,81 +734,65 @@ def chat(req: ChatRequest):
         history=trimmed_history,
     )
 
-    # 2) Optionally generate grounded follow-up (chunk_index + intra-chunk adjacency)
+    # =========================================================
+    # FOLLOW-UP EXTRACTION (from followup_pool_docs only)
+    # =========================================================
     followup_candidates: List[str] = []
+    if should_generate_followup(answer_text) and followup_pool_docs:
+        pool_items: List[str] = []
+        for d in followup_pool_docs:
+            src = (d.get("metadata") or {}).get("source", "unknown")
+            items = extract_key_points(d["document"])
+            print(f"[FOLLOWUP] from doc id={d['id']} source={src} extracted_key_points={len(items)}")
+            pool_items.extend(items)
 
-    # Keep info per chunk to support fallback later
-    per_chunk_info: List[Dict[str, Any]] = []
-    used_chunks: List[Dict[str, Any]] = []
+        # Deduplicate
+        before_dedup = len(pool_items)
+        pool_items = list(dict.fromkeys(pool_items))
+        print(f"[FOLLOWUP] pool_items before_dedup={before_dedup} after_dedup={len(pool_items)}")
 
-    # First: same-chunk adjacency based on bullet-level usage
-    for d in context_docs:
-        chunk_text = d["document"]
-        items = extract_key_points(chunk_text)
-        used_items = match_answered_items(answer_text, items)
+        # Remove anything overlapping with the answer
+        ans_words = set(answer_text.lower().split())
+        filtered_items: List[str] = []
+        for item in pool_items:
+            item_words = set(item.lower().split())
+            overlap = len(ans_words & item_words)
+            if overlap == 0:
+                filtered_items.append(item)
 
-        per_chunk_info.append(
-            {
-                "chunk": d,
-                "items": items,
-                "used_items": used_items,
-            }
-        )
+        print(f"[FOLLOWUP] filtered_items count (no overlap with answer)={len(filtered_items)}")
 
-        neighbors_same = select_adjacent_items(items, used_items)
-        followup_candidates.extend(neighbors_same)
+        # Select the best semantic bridge (match to the original question)
+        best_item = ""
+        best_score = 0
+        q_words = set(req.question.lower().split())
 
-        if used_items:
-            used_chunks.append(d)
+        for item in filtered_items:
+            item_words = set(item.lower().split())
+            score = len(q_words & item_words)
+            if score > best_score:
+                best_score = score
+                best_item = item
 
-    # Second: adjacent chunks based on chunk_index
-    adjacent_chunks = select_adjacent_chunks(reranked, used_chunks)
-    for ch in adjacent_chunks:
-        items = extract_key_points(ch["document"])
-        per_chunk_info.append(
-            {
-                "chunk": ch,
-                "items": items,
-                "used_items": [],
-            }
-        )
-        followup_candidates.extend(items)
+        print(f"[FOLLOWUP] best_score={best_score}")
 
-    # Deduplicate early (preserve order)
-    followup_candidates = list(dict.fromkeys(followup_candidates))
+        if best_item:
+            # Normal case: lexical match exists
+            print(f"[FOLLOWUP] best_item='{best_item}'")
+            followup_candidates = [best_item]
+        else:
+            # FALLBACK: still allow LLM to generate a grounded follow-up
+            # by giving it the first 3 filtered items
+            print("[FOLLOWUP] no suitable lexical match → using fallback items")
+            followup_candidates = filtered_items[:3]
 
-    # =====================================================
-    # Fallback follow-up logic:
-    # If neighbors are empty, fall back to unused items from
-    # chunks that contributed to the answer, then any items.
-    # =====================================================
-    if should_generate_followup(answer_text):
-        if not followup_candidates:
-            # 1) Try unused items from chunks where some items were used
-            fallback_items: List[str] = []
-            for info in per_chunk_info:
-                items = info["items"]
-                used_items = set(info["used_items"] or [])
-                if items and used_items and len(used_items) < len(items):
-                    unused = [i for i in items if i not in used_items]
-                    fallback_items.extend(unused)
+    else:
+        print("[FOLLOWUP] skipped: either suppression or empty followup pool")
 
-            # 2) If still empty, consider any items from context chunks
-            if not fallback_items:
-                for info in per_chunk_info:
-                    items = info["items"]
-                    if items:
-                        fallback_items.extend(items)
-
-            # Deduplicate
-            fallback_items = list(dict.fromkeys(fallback_items))
-            followup_candidates = fallback_items
-
-    # Build the follow-up context text from candidates
     followup_context_text = ""
     next_question = ""
 
-    if should_generate_followup(answer_text) and followup_candidates:
+    if followup_candidates:
         followup_context_text = "\n".join(followup_candidates[:6])
         print("\n[FOLLOWUP CONTEXT]\n", followup_context_text)
 
@@ -820,9 +800,11 @@ def chat(req: ChatRequest):
             model=OPENAI_MODEL,
             question=req.question,
             answer=answer_text,
-            context_text=followup_context_text,
+            candidate_snippets=followup_context_text,
             history=trimmed_history,
         )
+    else:
+        print("[FOLLOWUP] no followup_candidates → next_question will be empty")
 
     elapsed_ms = round((time.time() - start) * 1000)
     print(
@@ -832,14 +814,14 @@ def chat(req: ChatRequest):
 
     # Debug: show top few reranked docs
     for i, r in enumerate(reranked[:3]):
-        src = r["metadata"].get("source", "unknown")
+        src = (r.get("metadata") or {}).get("source", "unknown")
         dist = r.get("distance", 0)
         print(f"[DEBUG] Top{i+1} src={src} dist={dist}")
 
-    # Build UI-friendly sources
+    # Build UI-friendly sources (from the chunks actually used for the answer)
     structured_sources = build_sources_ui(context_docs)
 
-    
+    print("==================== /chat END ====================\n")
 
     return ChatResponse(
         answer=answer_text,
