@@ -261,8 +261,8 @@ def llm_rerank(query: str, items: List[Dict[str, Any]], rerank_k: int) -> List[D
     for idx, it in enumerate(candidates, start=1):
         cid = it["id"]
         text = it["document"].replace("\n", " ")
-        if len(text) > 700:
-            text = text[:700] + "..."
+        # if len(text) > 700:
+        #     text = text[:700] + "..."
         chunk_lines.append(f"{idx}. [ID: {cid}] {text}")
 
     chunks_block = "\n\n".join(chunk_lines)
@@ -478,7 +478,7 @@ def generate_answer(model: str, question: str, context_text: str, history: List[
     resp = oai.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.2,
+        temperature=0.1,
     )
     answer = resp.choices[0].message.content.strip()
     print(f"[ANSWER] answer_text (first 400 chars): {answer[:400]}")
