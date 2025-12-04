@@ -165,6 +165,7 @@ services:
       - "9300:9300"
     environment:
       CHAT_BACKEND_URL: http://chat-backend:9100
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
       PYTHONUNBUFFERED: 1
     volumes:
       - ./chat-feature/chat-agents:/app
@@ -172,6 +173,7 @@ services:
       chat-backend:
         condition: service_started
     restart: unless-stopped
+
 
 volumes:
   chromadb_data:
