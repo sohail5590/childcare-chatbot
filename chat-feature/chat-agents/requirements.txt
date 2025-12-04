@@ -5,3 +5,4 @@ requests
 pydantic<3
 PyPDF2
 python-docx
+openai>=1.40.0

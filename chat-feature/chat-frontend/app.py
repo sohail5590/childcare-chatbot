@@ -73,7 +73,7 @@ st.markdown(HIDE_TOP_RIGHT, unsafe_allow_html=True)
 # API URLs
 # ------------------------------------------------------------
 RAG_API_URL = os.getenv("RAG_API_URL", "http://chat-backend:9100/chat")
-AGENT_API_URL = os.getenv("AGENT_API_URL", "http://chat-agents:9200/analyze_form")
+AGENT_API_URL = os.getenv("AGENT_API_URL", "http://chat-agents:9300/analyze_form")
 
 # ------------------------------------------------------------
 # SESSION STATE
