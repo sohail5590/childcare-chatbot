@@ -412,7 +412,7 @@ MULTI-DOCUMENT REQUIREMENT:
 - If the question mentions two concepts which are known to belong to different documents, the answer MUST cite BOTH documents OR state clearly that one is missing.
 
 FORMATTING:
-- Answers must be concise, factual and complete.
+- Answers must be factual and complete.
 - Bullets or short paragraphs are allowed.
 - HTML tables must render cleanly.
 
