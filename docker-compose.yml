@@ -1,13 +1,9 @@
 version: "3.9"
 
 services:
-  # ========================================
-  # 1️⃣ PostgreSQL Database
-  # ========================================
   postgres:
     image: postgres:15
     container_name: rag_ccb_postgres
-    restart: unless-stopped
     environment:
       POSTGRES_DB: childcare
       POSTGRES_USER: admin
@@ -16,28 +12,19 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
 
-  # ========================================
-  # 2️⃣ Database API (auto-seeded)
-  # ========================================
   db-api:
-    build:
-      context: ./frontend/db
+    build: ./frontend/db
     container_name: rag_ccb_db_api
     ports:
       - "9200:9200"
     environment:
       DATABASE_URL: postgresql://admin:admin123@postgres:5432/childcare
-      PYTHONUNBUFFERED: 1
     depends_on:
       - postgres
     restart: unless-stopped
-    # ❗ NOTE: NO volumes override here
-    # ❗ NOTE: NO command override—start.sh will run automatically
 
-  # ========================================
-  # 3️⃣ ChromaDB (Vector Store)
-  # ========================================
   chromadb:
     image: ghcr.io/chroma-core/chroma:latest
     container_name: rag_ccb_chromadb
@@ -47,22 +34,16 @@ services:
       - chromadb_data:/chroma/chroma
       - ./Data:/app/Data
     environment:
-      - IS_PERSISTENT=TRUE
-      - PERSIST_DIRECTORY=/chroma/chroma
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8000'"]
       interval: 5s
-      timeout: 3s
       retries: 20
-      start_period: 10s
     restart: unless-stopped
 
-  # ========================================
-  # 4️⃣ Ingestion Backend (Uploads + Vectorization)
-  # ========================================
   backend:
-    build:
-      context: ./backend
+    build: ./backend
     container_name: rag_ccb_backend
     ports:
       - "9000:9000"
@@ -72,46 +53,17 @@ services:
       - ./Data:/app/Data
       - ./config.json:/app/config.json
       - chromadb_data:/chroma/chroma
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8000
-      - PYTHONUNBUFFERED=1
-      - HF_HUB_DISABLE_SSL_VERIFICATION=1
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
     depends_on:
       chromadb:
         condition: service_healthy
     restart: unless-stopped
 
-  # ========================================
-  # 5️⃣ Admin Frontend (Streamlit)
-  # ========================================
-  frontend:
-    build:
-      context: ./frontend
-    container_name: rag_ccb_frontend
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./frontend:/app
-      - ./config.json:/app/config.json
-    depends_on:
-      backend:
-        condition: service_started
-      db-api:
-        condition: service_started
-    environment:
-      DB_API_URL: http://db-api:9200
-      DATABASE_URL: postgresql://admin:admin123@postgres:5432/childcare
-    restart: unless-stopped
-
-  # ========================================
-  # 6️⃣ Chat Backend (FastAPI)
-  # ========================================
   chat-backend:
-    build:
-      context: ./chat-feature/chat-backend
+    build: ./chat-feature/chat-backend
     container_name: rag_chat_backend
     ports:
       - "9100:9100"
@@ -120,60 +72,45 @@ services:
       - ./Data:/app/Data
       - ./hf_cache:/app/.hf_cache
       - chromadb_data:/chroma/chroma
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8000
-      - PYTHONUNBUFFERED=1
-      - HF_HUB_DISABLE_SSL_VERIFICATION=1
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
     depends_on:
       chromadb:
         condition: service_healthy
     command: uvicorn main:app --host 0.0.0.0 --port 9100 --reload
     restart: unless-stopped
 
-  # ========================================
-  # 7️⃣ Chat Frontend (Streamlit)
-  # ========================================
+  chat-agents:
+    build: ./chat-feature/chat-agents
+    container_name: rag_chat_agents
+    ports:
+      - "9300:9300"
+    volumes:
+      - ./chat-feature/chat-agents:/app
+    env_file: .env
+    environment:
+      CHAT_BACKEND_URL: http://chat-backend:9100
+    depends_on:
+      - chat-backend
+    restart: unless-stopped
+
   chat-frontend:
-    build:
-      context: ./chat-feature/chat-frontend
+    build: ./chat-feature/chat-frontend
     container_name: rag_chat_frontend
     ports:
       - "8601:8501"
     volumes:
       - ./chat-feature/chat-frontend:/app
-    env_file:
-      - .env
-    environment:
-      - STREAMLIT_SERVER_PORT=8501
-      - STREAMLIT_SERVER_HEADLESS=true
-      - CHAT_BACKEND_URL=http://chat-backend:9100
-      - CHAT_AGENTS_URL=http://chat-agents:9300
-    depends_on:
-      chat-backend:
-        condition: service_started
-    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
-    restart: unless-stopped
-
-  chat-agents:
-    build:
-      context: ./chat-feature/chat-agents
-    container_name: rag_chat_agents
-    ports:
-      - "9300:9300"
+    env_file: .env
     environment:
       CHAT_BACKEND_URL: http://chat-backend:9100
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
-      PYTHONUNBUFFERED: 1
-    volumes:
-      - ./chat-feature/chat-agents:/app
+      CHAT_AGENTS_URL: http://chat-agents:9300
     depends_on:
-      chat-backend:
-        condition: service_started
+      - chat-backend
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
     restart: unless-stopped
-
 
 volumes:
   chromadb_data:
