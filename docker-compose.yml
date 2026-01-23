@@ -42,6 +42,25 @@ services:
       retries: 20
     restart: unless-stopped
 
+  frontend:
+    build: ./frontend
+    container_name: rag_ccb_frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app
+      - ./Data:/app/Data
+      - ./config.json:/app/config.json
+    env_file: .env
+    environment:
+      BACKEND_URL: http://backend:9000
+      DB_API_URL: http://db-api:9200
+    depends_on:
+      - backend
+      - db-api
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    restart: unless-stopped
+
   backend:
     build: ./backend
     container_name: rag_ccb_backend

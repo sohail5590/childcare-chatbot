@@ -103,12 +103,19 @@ def update_document_record(doc_id: int, payload: dict):
         pass
 
 
-def delete_from_vector_store(file_path: str):
+def delete_from_vector_store(file_path: str, state_name: str):
     """Call backend to delete vectors for a file."""
     try:
-        requests.post(f"{BACKEND_URL}/delete_document", json={"file_path": file_path}, timeout=15)
-    except:
-        pass
+        requests.post(
+            f"{BACKEND_URL}/delete_document",
+            json={
+                "file_path": file_path,
+                "state": state_name
+            },
+            timeout=15
+        )
+    except Exception as e:
+        st.error(f"Vector delete failed: {e}")
 
 
 def revectorize_document(state: str, uploaded_file, old_file_path: str | None):
@@ -143,7 +150,7 @@ def revectorize_document(state: str, uploaded_file, old_file_path: str | None):
 
         # cleanup old vector file
         if old_file_path:
-            delete_from_vector_store(old_file_path)
+            delete_from_vector_store(file_path=old_file_path,  state_name=state)
 
         return uploaded_file.name, new_file_path
 
@@ -419,7 +426,7 @@ def show_admin_panel():
                     delete_document_record(delete_id)
                     fp = doc_to_delete["file_path"]
                     if fp:
-                        delete_from_vector_store(fp)
+                        delete_from_vector_store(file_path=fp, state_name=doc_to_delete["state_name"])
                 st.success("Document deleted.")
                 st.session_state.confirm_delete_doc_id = None
                 st.rerun()

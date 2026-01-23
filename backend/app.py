@@ -569,3 +569,36 @@ async def ask_question(request: QuestionRequest):
     Placeholder API for simple QA (not used by new chat-feature backend).
     """
     return {"message": "placeholder"}
+
+@app.post("/delete_document")
+async def delete_document(payload: Dict[str, str]):
+    """
+    Deletes all vectors related to a file from ChromaDB.
+    Payload: { "file_path": "...", "state": "California" }
+    """
+    try:
+        file_path = payload.get("file_path")
+        state = payload.get("state")
+
+        if not file_path:
+            return JSONResponse(status_code=400, content={"error": "file_path required"})
+
+        if not state or state not in state_collections:
+            return JSONResponse(status_code=400, content={"error": "Valid state required"})
+
+        filename = Path(file_path).name
+        collection = state_collections[state]
+
+        before = collection.count()
+        collection.delete(where={"source": filename})
+        after = collection.count()
+
+        return {
+            "success": True,
+            "file": filename,
+            "deleted_chunks": before - after
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
