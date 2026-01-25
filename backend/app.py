@@ -316,26 +316,6 @@ def get_chunk_categories(text: str) -> Dict[str, float]:
 
 @app.post("/vectorize")
 async def vectorize_documents(request: VectorizeRequest):
-    """
-    Vectorizes uploaded documents for a given state.
-
-    - Uses dynamic state -> collection mapping from config.json.
-    - Supports common doc types:
-        * .pdf       -> PyPDFLoader
-        * .doc/.docx -> UnstructuredWordDocumentLoader
-        * .csv       -> CSVLoader
-        * everything else -> TextLoader (file-agnostic fallback)
-    - Splits into chunks and stores embeddings + metadata in Chroma.
-
-    Metadata schema is aligned with chat-feature backend:
-        {
-            "source": <filename>,
-            "state": <state name>,
-            "chunk_index": <int>,
-            "file_type": <extension>,
-            "categories": <JSON string of category scores>
-        }
-    """
 
     try:
         state = request.state
@@ -451,11 +431,44 @@ async def get_states():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+# @app.get("/collections")
+# async def get_collections():
+#     """
+#     Lists all Chroma collections and shows small sample of their content.
+#     """
+#     try:
+#         cols = chroma_client.list_collections()
+#         result = []
+
+#         for col in cols:
+#             c = chroma_client.get_collection(col.name)
+#             count = c.count()
+
+#             peek = None
+#             if count > 0:
+#                 pdata = c.peek(limit=3)
+#                 peek = {
+#                     "documents": pdata.get("documents", []),
+#                     "metadatas": pdata.get("metadatas", []),
+#                     "ids": pdata.get("ids", []),
+#                 }
+
+#             result.append(
+#                 {
+#                     "name": col.name,
+#                     "count": count,
+#                     "sample": peek,
+#                 }
+#             )
+
+#         return {"collections": result}
+
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/collections")
 async def get_collections():
-    """
-    Lists all Chroma collections and shows small sample of their content.
-    """
     try:
         cols = chroma_client.list_collections()
         result = []
@@ -464,20 +477,48 @@ async def get_collections():
             c = chroma_client.get_collection(col.name)
             count = c.count()
 
-            peek = None
+            chunks = None
             if count > 0:
-                pdata = c.peek(limit=3)
-                peek = {
-                    "documents": pdata.get("documents", []),
-                    "metadatas": pdata.get("metadatas", []),
-                    "ids": pdata.get("ids", []),
-                }
+                limit = min(25, count)
+
+                data = c.get(
+                    limit=limit,
+                    include=["documents", "metadatas"]
+                )
+
+                ids = data.get("ids", []) or []
+                docs = data.get("documents", []) or []
+                metas = data.get("metadatas", []) or []
+
+                chunks = []
+                for i in range(len(ids)):
+                    md = metas[i] if i < len(metas) else {}
+
+                    # Optional: parse categories JSON string into dict
+                    raw_cat = (md or {}).get("categories")
+                    if isinstance(raw_cat, str):
+                        try:
+                            md["categories"] = json.loads(raw_cat)
+                        except Exception:
+                            pass
+
+                    doc_text = docs[i] if i < len(docs) else ""
+                    doc_preview = (doc_text or "")[:15]
+
+                    chunks.append(
+                        {
+                            "id": ids[i],
+                            "document_preview": doc_preview,
+                            "metadata": md,
+                        }
+                    )
 
             result.append(
                 {
                     "name": col.name,
                     "count": count,
-                    "sample": peek,
+                    "chunks_returned": 0 if not chunks else len(chunks),
+                    "chunks": chunks,
                 }
             )
 
@@ -485,6 +526,7 @@ async def get_collections():
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 # =========================================================
