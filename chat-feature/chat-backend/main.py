@@ -131,6 +131,7 @@ class ChatRequest(BaseModel):
     # Defaults chosen so you naturally get 5 (answer) + 15 (follow-up pool)
     top_k: Optional[int] = 40       # vector DB n_results
     rerank_k: Optional[int] = 20    # how many to send into LLM reranker
+    lookup_online: Optional[bool] = False
 
 
 class ChatResponse(BaseModel):
@@ -162,6 +163,7 @@ def retrieve(query: str, collection, top_k: int):
     """Initial vector retrieval from Chroma."""
     print(f"[RETRIEVE] query='{query}' top_k={top_k}")
     q_vec = embedder.encode(query).tolist()
+    print("Q vector = ",q_vec)
     res = collection.query(query_embeddings=[q_vec], n_results=top_k)
 
     docs = res.get("documents", [[]])[0]
@@ -457,6 +459,28 @@ Return ONLY valid JSON in this exact shape:
 # LLM Calls (Answer + Follow-up)
 # =========================================================
 
+ONLINE_SYSTEM_PROMPT = """
+You are a helpful assistant.
+
+- Answer the user's question directly.
+- If you are unsure, say so.
+- Keep it concise but complete.
+"""
+
+def generate_online_answer(model: str, question: str, history: List[ChatTurn]) -> str:
+    messages = [{"role": "system", "content": ONLINE_SYSTEM_PROMPT}]
+
+    for h in history:
+        messages.append({"role": h.role, "content": h.content})
+
+    messages.append({"role": "user", "content": question})
+
+    resp = oai.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content.strip()
 
 def generate_answer(model: str, question: str, context_text: str, history: List[ChatTurn]) -> str:
     messages = [{"role": "system", "content": ANSWER_SYSTEM_PROMPT}]
@@ -697,6 +721,20 @@ def chat(req: ChatRequest):
     print(f"[REQ] question='{req.question}'")
     print(f"[REQ] state='{req.state}' top_k={req.top_k} rerank_k={req.rerank_k}")
 
+    trimmed_history = trim_history(req.history or [])
+    if req.lookup_online:
+        print("[MODE] lookup_online=True → skipping Chroma/RAG pipeline")
+        answer_text = generate_online_answer(
+            model=OPENAI_MODEL,
+            question=req.question,
+            history=trimmed_history,
+        )
+        return ChatResponse(
+            answer=answer_text,
+            next_question="",
+            sources=[],
+        )
+
     collection = pick_collection(req.state)
     retrieved = retrieve(req.question, collection, top_k=req.top_k)
 
@@ -724,7 +762,7 @@ def chat(req: ChatRequest):
     # Build answer context only from top 5
     answer_context, context_docs = build_answer_context(answer_docs)
 
-    trimmed_history = trim_history(req.history or [])
+    # trimmed_history = trim_history(req.history or [])
 
     # 1) Generate grounded answer
     answer_text = generate_answer(

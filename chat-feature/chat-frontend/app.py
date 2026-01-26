@@ -90,6 +90,8 @@ if "messages" not in st.session_state:
 if "last_followup_question" not in st.session_state:
     st.session_state.last_followup_question = None
 
+if "lookup_online" not in st.session_state:
+    st.session_state.lookup_online = False
 # ------------------------------------------------------------
 # CSS — Chat UI + Floating Status + Collapsible Sources
 # ------------------------------------------------------------
@@ -273,6 +275,12 @@ if st.session_state.state is None:
 st.title(f"💬 Chat with the Assistant ({st.session_state.state})")
 st.caption("Ask questions about childcare & adoption regulations. Answers are grounded in your state's documents.")
 
+st.session_state.lookup_online = st.toggle(
+    "🔎 Lookup answers online",
+    value=st.session_state.lookup_online,
+    help="If enabled, answers come directly from OpenAI (no vector DB / no sources).",
+)
+
 chat_container = st.container()
 
 # ------------------------------------------------------------
@@ -412,6 +420,7 @@ if prompt:
                 "question": prompt,
                 "state": st.session_state.state,
                 "history": history_payload,
+                "lookup_online": st.session_state.lookup_online,
             }
 
             resp = requests.post(RAG_API_URL, json=payload, timeout=120)
