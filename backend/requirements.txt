@@ -33,3 +33,5 @@ unstructured
 python-docx
 pypdf
 unstructured[docx]
+sqlalchemy
+psycopg2-binary

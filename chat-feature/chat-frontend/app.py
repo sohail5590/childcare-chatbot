@@ -5,6 +5,11 @@ import time
 import re
 import json
 import base64
+from uuid import uuid4
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.core.exceptions import ResourceExistsError
 
 
 # ------------------------------------------------------------
@@ -43,6 +48,26 @@ def clean_for_memory(raw_html: str) -> str:
     no_tags = re.sub(r"<[^>]+>", "", no_b64)
     return no_tags.strip()
 
+def fetch_states():
+    try:
+        resp = requests.get(STATES_API_URL, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        states = data.get("states", [])
+
+        options = []
+        for item in states:
+            if isinstance(item, dict):
+                value = item.get("value") or item.get("label")
+                if value:
+                    options.append(value)
+            elif isinstance(item, str):
+                options.append(item)
+
+        return options
+    except Exception as e:
+        st.error(f"Failed to load states/categories from backend: {e}")
+        return []
 
 BOT_ICON = load_icon("assets/chat-agent.png")
 
@@ -51,7 +76,7 @@ BOT_ICON = load_icon("assets/chat-agent.png")
 # ------------------------------------------------------------
 
 st.set_page_config(
-    page_title="State RAG Chatbot",
+    page_title="AI Assistant",
     page_icon="🧠",
     layout="wide",
     menu_items={},  # disables Deploy, Feedback, About
@@ -74,7 +99,7 @@ st.markdown(HIDE_TOP_RIGHT, unsafe_allow_html=True)
 # ------------------------------------------------------------
 RAG_API_URL = os.getenv("RAG_API_URL", "http://chat-backend:9100/chat")
 AGENT_API_URL = os.getenv("AGENT_API_URL", "http://chat-agents:9300/analyze_form")
-
+STATES_API_URL = os.getenv("STATES_API_URL", "http://chat-backend:9100/states")
 # ------------------------------------------------------------
 # SESSION STATE
 # ------------------------------------------------------------
@@ -257,10 +282,16 @@ st.markdown(CHAT_CSS, unsafe_allow_html=True)
 # STEP 1 — STATE SELECTION
 # ------------------------------------------------------------
 if st.session_state.state is None:
-    st.title("🗺️ State Knowledge Chatbot")
-    st.markdown("### Select which state’s regulations you want to explore.")
+    st.title("🗺️ AI Assistant")
+    st.markdown("### Select a topic and start asking questions related to the topic.")
 
-    state_option = st.selectbox("Choose a state", ["California", "New York"])
+    state_options = fetch_states()#st.selectbox("Choose a state", ["California", "New York"])
+    
+    if not state_options:
+        st.warning("No states/categories are available from the backend.")
+        st.stop()
+
+    state_option = st.selectbox("Select a Topic", state_options)
 
     if st.button("Start Chat"):
         st.session_state.state = state_option
@@ -277,6 +308,43 @@ st.caption("Ask questions about childcare & adoption regulations. Answers are gr
 
 st.session_state.lookup_online = st.toggle(
     "🔎 Lookup answers online",
+    app = FastAPI()
+
+    AZURE_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    AZURE_CONTAINER = os.getenv("AZURE_CONTAINER_NAME", "pdf-uploads")
+
+    if not AZURE_CONN_STR:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is required")
+
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONN_STR)
+    container_client = blob_service_client.get_container_client(AZURE_CONTAINER)
+
+    try:
+        container_client.create_container()
+    except ResourceExistsError:
+        pass
+
+
+    @app.post("/upload-pdf")
+    async def upload_pdf(file: UploadFile = File(...)):
+        filename = Path(file.filename or "")
+        if filename.suffix.lower() != ".pdf" and file.content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+        blob_name = f"{uuid4()}.pdf"
+        blob_client = container_client.get_blob_client(blob_name)
+
+        content = await file.read()
+        blob_client.upload_blob(
+            content,
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/pdf"),
+        )
+
+        return {
+            "blob_name": blob_name,
+            "url": blob_client.url,
+        }
     value=st.session_state.lookup_online,
     help="If enabled, answers come directly from OpenAI (no vector DB / no sources).",
 )

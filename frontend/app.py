@@ -176,7 +176,7 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-st.set_page_config(page_title="Unified Childcare Portal", layout="wide")
+st.set_page_config(page_title="Admin Panel", layout="wide")
 
 
 # =========================================================
@@ -210,7 +210,7 @@ def show_login_page():
         """
         <div class="login-card">
             <div class="gov-logo">🏛️</div>
-            <div class="gov-title">Unified Childcare<br>Chat Assistant</div>
+            <div class="gov-title">AI Assistant</div>
             <div class="gov-subtitle">Please sign in to continue</div>
         </div>
         """,
@@ -278,7 +278,7 @@ def show_admin_panel():
     with tab_upload:
         st.subheader("Upload Documents to Knowledge Base")
 
-        state = st.selectbox("Select State *", [""] + state_names)
+        state = st.selectbox("Select a Topic *", [""] + state_names)
         state_id = id_map.get(state) if state else None
 
         county_id = None
@@ -376,7 +376,7 @@ def show_admin_panel():
             return
 
         state_options = {s["name"]: s["id"] for s in states_with_docs}
-        chosen_state = st.selectbox("Choose a state:", list(state_options.keys()))
+        chosen_state = st.selectbox("Select a Topic:", list(state_options.keys()))
         chosen_state_id = state_options[chosen_state]
 
         docs = get_documents_for_state(chosen_state_id)

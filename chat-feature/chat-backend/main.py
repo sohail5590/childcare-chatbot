@@ -13,7 +13,10 @@ from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 from dotenv import load_dotenv
 import re  # for follow-up extraction helpers
-
+# from frontend.db.database import SessionLocal
+# from frontend.db.models import State
+import os
+from sqlalchemy import create_engine, text
 
 # =========================================================
 # Environment Setup
@@ -62,28 +65,129 @@ app.add_middleware(
 
 CONFIG_FILE = PROJECT_ROOT / "config.json"
 
+def normalize_state_name_for_collection(name: str) -> str:
+    """
+    Convert DB state/category names into a Chroma collection name.
+    Example:
+      'Student Records & Enrollment Data'
+      -> 'student_records_enrollment_data'
+    """
+    name = name.strip().lower()
+    name = re.sub(r"&", " and ", name)
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name
+def load_state_collection_mapping_from_db() -> Dict[str, str]:
+    """
+    Fallback: read states from Postgres directly.
+    Avoid importing database/models packages from another service.
+    """
 
-def load_state_collection_mapping() -> Dict[str, str]:
-    """Load state → Chroma collection mapping from config.json (lowercased keys)."""
-    if not CONFIG_FILE.exists():
-        print("config.json not found; using fallback CA/NY mapping")
-        return {
+    database_url = os.getenv(
+    "DATABASE_URL",
+    "postgresql://admin:admin123@postgres:5432/childcare",
+    )
+    try:
+        engine = create_engine(database_url, future=True)
+        mapping: Dict[str, str] = {}
+
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT name FROM states"))
+            for row in result:
+                raw_name = row[0]
+                state_name = (raw_name or "").strip().lower()
+                if state_name:
+                    mapping[state_name] = normalize_state_name_for_collection(raw_name)
+
+        print(f"Loaded states mapping from DB: {mapping}")
+        return mapping
+
+    except Exception as e:
+        print(f"Failed to load states from DB: {e}")
+        return {}
+# def load_state_collection_mapping_from_db() -> Dict[str, str]:
+#     """
+#     Fallback: read states from DB seeded by db.py.
+#     Assumes collection name can be derived from state/category name.
+#     """
+#     try:
+
+#         db = SessionLocal()
+#         try:
+#             states = db.query(State).all()
+#             mapping: Dict[str, str] = {}
+
+#             for st in states:
+#                 state_name = (st.name or "").strip().lower()
+#                 if state_name:
+#                     mapping[state_name] = normalize_state_name_for_collection(st.name)
+
+#             print(f"Loaded states mapping from DB: {mapping}")
+#             return mapping
+#         finally:
+#             db.close()
+
+#     except Exception as e:
+#         print(f"Failed to load states from DB: {e}")
+#         return {}
+
+def load_state_collection_mapping():
+    """
+    Load state/category -> Chroma collection mapping.
+    Priority:
+      1. config.json
+      2. DB seeded states
+    """
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+
+            mapping: Dict[str, str] = {}
+            for st in cfg.get("states", []):
+                name = st.get("name", "").strip().lower()
+                cname = st.get("collection_name")
+                if name and cname:
+                    mapping[name] = normalize_state_name_for_collection(name)
+
+            if mapping:
+                print(f"Loaded states mapping from config.json: {mapping}")
+                return mapping
+        except Exception as e:
+            print(f"Failed reading config.json: {e}")
+
+    print("config.json missing/empty; falling back to DB states")
+    db_mapping = load_state_collection_mapping_from_db()
+    if db_mapping:
+        return db_mapping
+
+    print("No states found in DB either; using empty mapping")
+    return {
             "california": "california_state",
             "new york": "newyork_state",
         }
 
-    with open(CONFIG_FILE, "r") as f:
-        cfg = json.load(f)
+# def load_state_collection_mapping() -> Dict[str, str]:
+#     """Load state → Chroma collection mapping from config.json (lowercased keys)."""
+#     if not CONFIG_FILE.exists():
+#         print("config.json not found; using fallback CA/NY mapping")
+#         return {
+#             "california": "california_state",
+#             "new york": "newyork_state",
+#         }
 
-    mapping: Dict[str, str] = {}
-    for st in cfg.get("states", []):
-        name = st.get("name", "").strip().lower()
-        cname = st.get("collection_name")
-        if name and cname:
-            mapping[name] = cname
+#     with open(CONFIG_FILE, "r") as f:
+#         cfg = json.load(f)
 
-    print(f"Loaded states mapping: {mapping}")
-    return mapping
+#     mapping: Dict[str, str] = {}
+#     for st in cfg.get("states", []):
+#         name = st.get("name", "").strip().lower()
+#         cname = st.get("collection_name")
+#         if name and cname:
+#             mapping[name] = cname
+
+#     print(f"Loaded states mapping: {mapping}")
+#     return mapping
 
 
 STATE_TO_COLLECTION = load_state_collection_mapping()
@@ -151,6 +255,9 @@ def normalize_state(s: str) -> str:
 
 def pick_collection(state: str):
     key = normalize_state(state)
+    if not STATE_TO_COLLECTION:
+        raise ValueError("No states/categories are configured in backend.")
+
     if key not in STATE_TO_COLLECTION:
         raise ValueError(
             f"Unsupported state '{state}'. Available: {list(STATE_TO_COLLECTION.keys())}"
@@ -712,6 +819,14 @@ def build_sources_ui(context_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 def health():
     return {"status": "ok"}
 
+@app.get("/states")
+def get_states():
+    return {
+        "states": [
+            {"label": state_name, "value": state_name}
+            for state_name in STATE_TO_COLLECTION.keys()
+        ]
+    }
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):

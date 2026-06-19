@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
-
+from sqlalchemy import create_engine, text
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
@@ -58,38 +58,181 @@ CONFIG_FILE = Path("/app/config.json")
 state_config: Dict[str, str] = {}
 state_collections: Dict[str, Any] = {}
 
+def normalize_state_folder(name: str) -> str:
+    return normalize_state_name_for_collection(name)
+# def load_config():
+#     """
+#     Load state -> collection_name mapping from config.json.
+#     Falls back to California/New York if file missing or invalid.
+#     """
+#     global state_config, state_collections
+#     try:
+#         if CONFIG_FILE.exists():
+#             with open(CONFIG_FILE, "r") as f:
+#                 cfg = json.load(f)
+#                 state_config = {
+#                     st["name"]: st["collection_name"]
+#                     for st in cfg.get("states", [])
+#                     if "name" in st and "collection_name" in st
+#                 }
+#             print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
+#         else:
+#             state_config = {
+#                 "California": "california_state",
+#                 "New York": "newyork_state",
+#             }
+#             print("[CONFIG] Using default states (config.json not found)", flush=True)
+#     except Exception as e:
+#         print(f"[CONFIG ERROR] {e}", flush=True)
+#         state_config = {
+#             "California": "california_state",
+#             "New York": "newyork_state",
+#         }
+
+# def load_config():
+#     """
+#     Load state -> collection mapping.
+#     Priority:
+#       1. /app/config.json
+#       2. DB states table
+#       3. last-resort hardcoded fallback
+#     """
+#     global state_config, state_collections
+
+#     try:
+#         mapping: Dict[str, str] = {}
+
+#         if CONFIG_FILE.exists():
+#             with open(CONFIG_FILE, "r") as f:
+#                 cfg = json.load(f)
+
+#             mapping = {
+#                 st["name"]: st["collection_name"]
+#                 for st in cfg.get("states", [])
+#                 if "name" in st and "collection_name" in st
+#             }
+
+#             if mapping:
+#                 print(f"[CONFIG] Loaded states from config: {list(mapping.keys())}", flush=True)
+
+#         if not mapping:
+#             print("[CONFIG] config.json missing/empty; falling back to DB states", flush=True)
+#             mapping = load_state_collection_mapping_from_db()
+
+#         if not mapping:
+#             print("[CONFIG] No config/DB states found; using default fallback", flush=True)
+#             mapping = {
+#                 "California": "california_state",
+#                 "New York": "newyork_state",
+#             }
+
+#         state_config = mapping
+#         state_collections = {}
+
+#     except Exception as e:
+#         print(f"[CONFIG ERROR] {e}", flush=True)
+#         state_config = {
+#             "California": "california_state",
+#             "New York": "newyork_state",
+#         }
+#         state_collections = {}
+
+def normalize_state_name_for_collection(name: str) -> str:
+    """
+    Convert DB state/category names into a Chroma collection name.
+    Example:
+      'Student Records & Enrollment Data'
+      -> 'student_records_enrollment_data'
+    """
+    name = name.strip().lower()
+    name = re.sub(r"&", " and ", name)
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name
+
+
+def load_state_collection_mapping_from_db() -> Dict[str, str]:
+    """
+    Fallback: read states from Postgres directly.
+    """
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://admin:admin123@postgres:5432/childcare",
+    )
+
+    try:
+        engine = create_engine(database_url, future=True)
+        mapping: Dict[str, str] = {}
+
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT name FROM states"))
+            for row in result:
+                raw_name = row[0]
+                state_name = (raw_name or "").strip()
+                if state_name:
+                    mapping[state_name] = normalize_state_name_for_collection(raw_name)
+
+        print(f"[CONFIG] Loaded states from DB: {list(mapping.keys())}", flush=True)
+        return mapping
+
+    except Exception as e:
+        print(f"[CONFIG][DB FALLBACK ERROR] {e}", flush=True)
+        return {}
 
 def load_config():
     """
-    Load state -> collection_name mapping from config.json.
-    Falls back to California/New York if file missing or invalid.
+    Load state -> collection mapping.
+    Priority:
+      1. config.json state names only
+      2. DB states table
+      3. fallback
     """
     global state_config, state_collections
+
     try:
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "r") as f:
-                cfg = json.load(f)
-                state_config = {
-                    st["name"]: st["collection_name"]
-                    for st in cfg.get("states", [])
-                    if "name" in st and "collection_name" in st
-                }
-            print(f"[CONFIG] Loaded states: {list(state_config.keys())}", flush=True)
-        else:
-            state_config = {
-                "California": "california_state",
-                "New York": "newyork_state",
+        mapping = {}
+
+        # if CONFIG_FILE.exists():
+        #     with open(CONFIG_FILE, "r") as f:
+        #         cfg = json.load(f)
+
+        #     states = [st.get("name", "").strip() for st in cfg.get("states", [])]
+        #     states = [s for s in states if s]
+
+        #     if states:
+        #         mapping = {
+        #             state_name: normalize_state_name_for_collection(state_name)
+        #             for state_name in states
+        #         }
+        #         print(f"[CONFIG] Loaded states from config: {list(mapping.keys())}", flush=True)
+
+        if not mapping:
+            print("[CONFIG] config.json missing/empty; falling back to DB states", flush=True)
+            mapping = load_state_collection_mapping_from_db()
+
+        if not mapping:
+            print("[CONFIG] No config/DB states found; using default fallback", flush=True)
+            fallback_states = ["California", "New York"]
+            mapping = {
+                s: normalize_state_name_for_collection(s)
+                for s in fallback_states
             }
-            print("[CONFIG] Using default states (config.json not found)", flush=True)
+
+        state_config = mapping
+        state_collections = {}
+
     except Exception as e:
         print(f"[CONFIG ERROR] {e}", flush=True)
+        fallback_states = ["California", "New York"]
         state_config = {
-            "California": "california_state",
-            "New York": "newyork_state",
+            s: normalize_state_name_for_collection(s)
+            for s in fallback_states
         }
-
+        state_collections = {}
 
 load_config()
+
+
 
 # =========================================================
 # Storage Paths
@@ -541,7 +684,8 @@ async def upload_documents(
     Uploads files into /app/Data/<state> for later vectorization.
     """
     try:
-        state_folder = state.lower().replace(" ", "_")
+        # state_folder = state.lower().replace(" ", "_")
+        state_folder = normalize_state_folder(state)
         upload_dir = DATA_DIR / state_folder
         upload_dir.mkdir(parents=True, exist_ok=True)
 

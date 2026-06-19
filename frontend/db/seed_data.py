@@ -19,10 +19,13 @@ def seed():
         print("🌱 Seeding states and counties...")
 
         states = {
-            "California": ["Los Angeles", "Orange", "San Diego"],
-            "Kentucky": ["Jefferson", "Fayette"],
-            "Ohio": ["Franklin", "Cuyahoga"],
-            "New York": ["Kings", "Queens", "Nassau"]
+            "Demo":[],
+            "Student Records & Enrollment Data": [],
+            "Tuition, Payments & Financial Aid Tracking": [],
+            "Daycare Compliance & Licensing": [],
+            "Staff Policies, SOPs & Operations": [],
+            "Reports, Logs & Daily Operations": [],
+            "Quran / Tahfidh Tracking": [],
         }
 
         for state_name, county_list in states.items():
