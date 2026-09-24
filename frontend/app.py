@@ -201,6 +201,20 @@ def show_login_page():
         .gov-logo { font-size: 36px; margin-bottom: 5px; }
         .gov-title { font-size: 1.5rem; font-weight: 700; color: #1e293b; }
         .gov-subtitle { font-size: 0.9rem; color: #475569; }
+        .stButton > button {
+            background-color: #16a34a;
+            border-color: #16a34a;
+            color: white;
+        }
+        .stButton > button:hover {
+            background-color: #15803d;
+            border-color: #15803d;
+            color: white;
+        }
+        .stButton > button:focus:not(:active) {
+            box-shadow: 0 0 0 0.2rem rgba(34, 197, 94, 0.5);
+            border-color: #16a34a;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -210,7 +224,7 @@ def show_login_page():
         """
         <div class="login-card">
             <div class="gov-logo">🏛️</div>
-            <div class="gov-title">Unified Childcare<br>Chat Assistant</div>
+            <div class="gov-title">Chatbot</div>
             <div class="gov-subtitle">Please sign in to continue</div>
         </div>
         """,
